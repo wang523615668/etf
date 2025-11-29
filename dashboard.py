@@ -1,17 +1,17 @@
-# dashboard.py (V22.0 - 策略参数化、回填优化、成本精确化)
+# dashboard.py (V21.1 - 修正语法错误，完善交易管理)
 
 import streamlit as st
 import pandas as pd
-import numpy as np
+import numpy as np 
 import json
 import os
 from datetime import datetime, timedelta
 import time
-import glob
+import glob 
 
-# ================= 配置区域 (V22.0) =================
+# ================= 配置区域 (V21.1) =================
 
-# 完整的指数列表 (保留您 V21.1 提供的配置)
+# 完整的指数列表
 TARGETS = {
     "大盘.csv": "大盘指数",
     "沪深300.csv": "沪深300指数",
@@ -20,7 +20,7 @@ TARGETS = {
     # 其他指数
     "全指医药.csv": "全指医药",
     "上证50.csv": "上证50",
-    "创业板指.csv": "创业板指",
+    "创业板指.csv": "创业板指", 
     "养老产业.csv": "养老产业",
     "中证红利.csv": "中证红利",
     "中证环保.csv": "中证环保",
@@ -33,287 +33,76 @@ TARGETS = {
     "中证白酒.csv": "中证白酒",
 }
 
-DATA_DIR = "index_data"
-STATE_FILE = "portfolio_status.json"
-
-# V22.0: 策略参数不再硬编码，它们将在 Streamlit Session State 中初始化。
-# 初始默认值，用于首次加载 Session State
-DEFAULT_STRATEGY_PARAMS = {
-    "MAX_UNITS": 10,                 # 最大买入份数
-    "STEP_PERCENT": 0.06,            # 阶梯买入跌幅 (6%)
-    "MIN_INTERVAL_DAYS": 30,         # 最小操作间隔天数 (30天)
-    "VOLATILITY_OVERRIDE_PCT": 0.12, # 波动率限制覆盖比例 (12%)
+# 限制详情和图表显示的最初三个核心指数 (在 V21.1 中主要用于主页数据展示)
+INITIAL_TARGETS = {
+    "大盘.csv": "大盘指数",
+    "沪深300.csv": "沪深300指数",
+    "中证500.csv": "中证500指数",
 }
 
-# ====================================================================
-# V23.1: Google Sheets 配置 & 连接 (新增区块)
-# ====================================================================
+DATA_DIR = "index_data"
+STATE_FILE = "portfolio_status.json" 
 
-# Streamlit 连接对象
-SHEETS_CONN = None 
+MAX_UNITS = 10          
+STEP_PERCENT = 0.06     
+MIN_INTERVAL_DAYS = 30 
+VOLATILITY_OVERRIDE_PCT = 0.12 
 
-# Sheets 配置（在 Streamlit Cloud 上运行时从 st.secrets['gdrive'] 获取）
-SHEETS_URL = st.secrets['gdrive']['sheet_url'] if 'gdrive' in st.secrets else "LOCAL_TEST_URL" 
-TRADE_SHEET_NAME = "Sheet1" # 您的交易记录工作表名称，如果不是 Sheet1 请修改
+# ================= 核心功能函数 =================
 
-def get_sheets_connection():
-    """V23.1: 获取 Streamlit Google Sheets/Drive 连接对象。只有当 Secrets 存在时才尝试连接。"""
-    global SHEETS_CONN
-    
-    # 只有当连接对象为空 并且 Secrets 中存在 'gdrive' 配置时，才尝试建立连接
-    if SHEETS_CONN is None and 'gdrive' in st.secrets:
-        try:
-            SHEETS_CONN = st.connection("gdrive", type="json")
-        except Exception as e:
-            # 云端 Secrets 配置错误时，捕获异常
-            print(f"警告：Sheets Secrets 配置存在错误。错误: {e}")
-            st.error("⚠️ Sheets Secrets 配置错误，请检查 Streamlit Cloud Settings -> Secrets。")
-            pass 
-            
-    return SHEETS_CONN
-
-# ====================================================================
-
-# ================= 状态与策略函数 (V23.1 优化 - Sheets I/O) =================
-
-def initialize_session_state():
-    """初始化 Streamlit Session State，包括策略参数。"""
-    if 'strategy_params' not in st.session_state:
-        st.session_state['strategy_params'] = DEFAULT_STRATEGY_PARAMS
-
-def get_strategy_param(key):
-    """获取当前策略参数值。"""
-    initialize_session_state()
-    return st.session_state['strategy_params'].get(key, DEFAULT_STRATEGY_PARAMS.get(key))
-
-# ----------------------------------------------------
-# V23.1: Google Sheets 数据加载/存储 (核心 I/O)
-# ----------------------------------------------------
-
-@st.cache_data(ttl=600) # 缓存 10 分钟
-def load_state_from_sheets():
-    """V23.1: 从 Google Sheets 加载所有交易数据并构建状态字典。"""
-    conn = get_sheets_connection()
-    state = {code: {"holdings": 0, "total_cost": 0.0, "history": []} for code in TARGETS.keys()} # 初始状态
-
-    if conn:
-        try:
-            # 读取整个交易记录表格
-            df_transactions = conn.read(spreadsheet=SHEETS_URL, worksheet=TRADE_SHEET_NAME, ttl="10m")
-            
-            if df_transactions.empty or 'index_name' not in df_transactions.columns:
-                return state
-
-            # 确保日期格式化和构建 state
-            df_transactions['date'] = pd.to_datetime(df_transactions['date']).dt.normalize()
-            
-            for _, row in df_transactions.iterrows():
-                # 查找交易名称对应的文件名键
-                fixed_filename_key = next((k for k, v in TARGETS.items() if v == row['index_name']), None)
-                
-                if fixed_filename_key and fixed_filename_key in state:
-                    transaction = {
-                        "date": row['date'],
-                        "type": row['type'], # BUY/SELL
-                        "price": float(row['price']),
-                        "unit": float(row['units']),
-                        "cost": float(row.get('cost', 0)), 
-                        "pe": float(row.get('pe_value', 0)) if pd.notna(row.get('pe_value')) else None,
-                        "close": float(row.get('index_close', 0)) if pd.notna(row.get('index_close')) else None
-                    }
-                    state[fixed_filename_key]['history'].append(transaction)
-            
-            # V23.1: 使用现有的 recalculate_holdings_and_cost
-            state = recalculate_holdings_and_cost(state)
-            return state
-
-        except Exception as e:
-            st.error(f"⚠️ 从 Google Sheets 加载交易数据失败。请检查 Secrets 和表格权限。\n错误: {e}")
-            # Sheets 失败时，尝试加载本地备份
-            return load_state_from_json_backup() 
-    
-    # 如果 Sheets 连接失败（例如本地运行），使用本地 JSON 备份
-    return load_state_from_json_backup() 
-
-
-def load_state_from_json_backup():
-    """V23.1: 仅用于本地测试或云端 Sheets 失败时的应急方案 (基于 V22.0 load_state 简化)。"""
-    STATE_FILE = "portfolio_status.json"
-    initial_state = {code: {"holdings": 0, "total_cost": 0.0, "history": []} for code in TARGETS.keys()}
-    
+def load_state():
+    """加载本地持仓状态"""
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                 state = json.load(f)
-                 # V23.1: 确保日期是 datetime 对象，以便后续处理
-                 for k in state:
-                    if 'history' in state[k]:
-                        # 兼容 V22.0 的日期格式
-                        state[k]['history'] = [{**h, 'date': pd.to_datetime(h['date'])} for h in state[k]['history']]
-                 
-                 # V23.1: 重新计算持仓和成本
-                 state = recalculate_holdings_and_cost(state) 
-                 return state 
-        except:
-             return initial_state
-    return initial_state
+            state = json.load(open(STATE_FILE, 'r', encoding='utf-8'))
+            for code in TARGETS.keys():
+                if code not in state:
+                     state[code] = {"holdings": 0, "history": []}
+                elif "history" not in state[code]:
+                     state[code]["history"] = []
+            return state
+        except json.JSONDecodeError:
+            print("警告: 状态文件损坏，已重置。")
+            return {code: {"holdings": 0, "history": []} for code in TARGETS.keys()}
+    return {code: {"holdings": 0, "history": []} for code in TARGETS.keys()}
 
+def save_state(state):
+    """保存本地持仓状态"""
+    # 每次保存前，重新计算 holdings，确保其与 history 保持一致
+    recalculate_holdings(state)
+    with open(STATE_FILE, 'w', encoding='utf-8') as f:
+        json.dump(state, f, ensure_ascii=False, indent=4)
 
-def save_transaction_to_sheets(fixed_filename_key, transaction_type, date, price, unit, current_close, current_pe):
-    """V23.1: 将单笔新交易记录附加到 Google Sheets 的末尾。"""
-    conn = get_sheets_connection()
-    if conn:
-        try:
-            index_name = TARGETS.get(fixed_filename_key, fixed_filename_key)
-            symbol = fixed_filename_key.split('.')[0]
-            
-            new_row = {
-                "ID": datetime.now().strftime('%Y%m%d%H%M%S') + str(np.random.randint(100, 999)),
-                "date": date.strftime("%Y-%m-%d"),
-                "index_name": index_name,
-                "symbol": symbol,
-                "type": transaction_type.upper(), # BUY/SELL
-                "units": unit,
-                "price": price,
-                "cost": unit * price,
-                "index_close": current_close, 
-                "pe_value": current_pe
-            }
-            
-            df_new_row = pd.DataFrame([new_row])
-            conn.insert(
-                spreadsheet=SHEETS_URL, 
-                worksheet=TRADE_SHEET_NAME, 
-                data=df_new_row
-            )
-            return True
-            
-        except Exception as e:
-            st.error(f"写入 Google Sheets 失败。请检查您的 Secrets 配置和表格权限。\n错误详情: {e}")
-            return False
-    
-    st.error("无法连接到 Google Sheets，交易记录未能保存！")
-    return False 
-
-
-# V23.1: 包装 Sheets/JSON 加载器
-def load_state():
-    """V23.1: 指向 Sheets 加载器"""
-    return load_state_from_sheets()
-
-# V23.1: 核心交易函数，负责数据获取、写入 Sheets 和触发刷新
-def add_transaction(state, fixed_filename_key, transaction_type, date, price, unit, current_close):
-    """
-    V23.1: 新增交易，将数据写入 Google Sheets，并触发 Streamlit 刷新。
-    """
-    
-    # 查找当前 PE
-    # 需要获取完整的指标数据来确保 PE/Close 的准确性
-    # 临时调用 get_full_index_metrics，full_data_frames={} 强制它在需要时加载数据
-    df_full_metrics = get_full_index_metrics(fixed_filename_key, state, full_data_frames={}) 
-    current_pe = df_full_metrics.get('current_pe')
-
-    # 调用 Sheets 写入
-    success = save_transaction_to_sheets(fixed_filename_key, transaction_type, date, price, unit, current_close, current_pe)
-    
-    if success:
-        st.cache_data.clear() # 清除缓存，强制重新从 Sheets 读取
-        st.rerun() 
-    
-    return state
-
-
-# 以下保持 V22.0 原有成本计算逻辑不变
-
-def calculate_index_cost(history):
-    """
-    V22.0: 根据历史记录，使用平均成本法(Average Cost)
-    精确计算当前持仓份数和总成本。
-    
-    返回: total_units, total_cost
-    """
-    total_units = 0.0
-    total_cost = 0.0
-    
-    for transaction in history:
-        unit = transaction.get('unit', 1)
-        # V23.1/Sheets 中 transaction.get('cost') 是准确的成本值 (unit * price)
-        cost_value = transaction.get('cost', transaction.get('price', 0) * unit) 
-        
-        if transaction.get('type').upper() == '买入' or transaction.get('type').upper() == 'BUY':
-            total_cost += cost_value
-            total_units += unit
-        elif transaction.get('type').upper() == '卖出' or transaction.get('type').upper() == 'SELL':
-            if total_units > 1e-6: # 检查是否有持仓
-                # 卖出时，成本按平均成本法扣除
-                avg_cost_per_unit = total_cost / total_units
-                total_cost -= avg_cost_per_unit * unit
-                total_units -= unit
-                
-                # 确保不会因浮点误差导致负值
-                if total_units < 1e-6:
-                    total_units = 0.0
-                    total_cost = 0.0
-            
-    return max(0.0, total_units), max(0.0, total_cost)
-
-
-def recalculate_holdings_and_cost(state):
-    """V22.0: 遍历所有指数，重新计算并更新状态中的持仓和总成本。"""
+def recalculate_holdings(state):
+    """根据交易历史重新计算当前持仓份数"""
     for code, data in state.items():
         if 'history' in data:
-            # 确保 history 里的 date 是 str，以兼容旧的 find_pe_by_date，
-            # 或者确保 find_pe_by_date 内部能处理 datetime
-            
-            # V23.1: load_state_from_sheets 已经确保 date 是 datetime，可以直接使用
-            total_units, total_cost = calculate_index_cost(data['history'])
-            state[code]['holdings'] = total_units
-            state[code]['total_cost'] = total_cost
+            total_units = 0
+            for transaction in data['history']:
+                unit = transaction.get('unit', 1) 
+                if transaction.get('type') == '买入':
+                    total_units += unit
+                elif transaction.get('type') == '卖出':
+                    total_units -= unit
+            # 确保持仓份数不低于零
+            state[code]['holdings'] = max(0, total_units)
     return state
 
-
-
-# ================= 核心数据处理函数 (V22.0 优化) =================
-
-# V22.0: 改进 find_pe_by_date，支持向前查找 (Forward Fill)
 def find_pe_by_date(df, target_date_str):
-    """根据日期查找对应的 PE 值和收盘点位。如果当天无数据，向前查找最近的交易日。"""
+    """根据日期查找对应的 PE 值和收盘点位。"""
     try:
         target_date = pd.to_datetime(target_date_str)
-        # 确保 df 索引是 datetime
-        df_temp = df.copy()
-        df_temp['Date'] = pd.to_datetime(df_temp['Date'], errors='coerce')
-        df_temp = df_temp.set_index('Date').sort_index()
-        
-        # 尝试精确匹配当天数据
-        if target_date in df_temp.index:
-             row = df_temp.loc[target_date]
-             return row['pe'], row['Close']
-             
-        # 如果当天没有数据，使用 reindex/ffill 查找最近的前一个交易日数据
-        # 创建一个包含目标日期的临时索引
-        temp_index = df_temp.index.union([target_date]).sort_values()
-        df_reindexed = df_temp.reindex(temp_index)
-        
-        # 使用前一个有效值填充目标日期
-        df_reindexed = df_reindexed.ffill()
-        
-        # 查找目标日期的 PE 和 Close
-        if target_date in df_reindexed.index:
-            row = df_reindexed.loc[target_date]
-            # 确保这不是一个 NaN 填充的结果
-            if pd.notna(row['pe']):
-                return row['pe'], row['Close']
-
+        date_series = pd.to_datetime(df['Date'], errors='coerce') 
+        row = df[date_series.dt.normalize() == target_date.normalize()]
+        if not row.empty:
+            close_price_col = '收盘' if '收盘' in df.columns else 'Close' 
+            return row.iloc[0]['pe'], row.iloc[0][close_price_col]
         return np.nan, np.nan
     except Exception as e:
-        # st.error(f"查找 PE/Close 失败: {e}")
         return np.nan, np.nan
-
 
 def find_latest_data_file(prefix):
     """查找匹配前缀的最新数据文件，并返回文件路径和修改时间 (支持模糊匹配)"""
-    # ... (此函数保持不变，因为它在您的 V21.1 中已经工作正常) ...
     search_pattern = os.path.join(DATA_DIR, f"{prefix}_*.csv")
     matching_files = glob.glob(search_pattern)
     
@@ -338,31 +127,20 @@ def find_latest_data_file(prefix):
 
 @st.cache_data(ttl=3600)
 def get_metrics_from_csv(file_path):
-    """
-    V22.0: 从本地 CSV 文件读取 PE 数据并计算指标。
-    （逻辑与您的 V21.1 保持一致，以确保兼容性）
-    """
+    """从本地 CSV 文件读取 PE 数据并计算指标。"""
     if not os.path.exists(file_path): return None
     try:
         df = pd.read_csv(file_path, encoding='utf-8', sep=',')
         if len(df) == 0: return None
-        
-        # V22.0: 兼容性调整，优先使用简短的列名
-        df = df.rename(columns={'PE-TTM正数等权': 'pe', '日期': 'Date', 
-                                'PE-TTM 分位点': 'pe_percentile', 
-                                '收盘点位': 'Close', '收盘': 'Close', 
-                                'Close': 'Close', 'Date': 'Date'})
-        
+        df = df.rename(columns={'PE-TTM正数等权': 'pe', '日期': 'Date', 'PE-TTM 分位点': 'pe_percentile', '收盘点位': 'Close', '收盘': 'Close'})
         for col in ['pe', 'pe_percentile', 'Close']:
              if col in df.columns:
-                 df[col] = df[col].astype(str).str.replace(r'[^\d.]', '', regex=True)
-                 df[col] = pd.to_numeric(df[col], errors='coerce') 
-        
+                df[col] = df[col].astype(str).str.replace(r'[^\d.]', '', regex=True)
+                df[col] = pd.to_numeric(df[col], errors='coerce') 
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         df = df[['Date', 'pe', 'pe_percentile', 'Close']].dropna(subset=['pe', 'Date', 'pe_percentile', 'Close'])
         df = df.sort_values('Date', ascending=True).reset_index(drop=True)
         if df.empty: return None
-        
         df = df.set_index('Date')
         WINDOW_3Y = '1095D'; WINDOW_5Y = '1825D'; 
         df['avg_3yr_roll'] = df['pe'].rolling(window=WINDOW_3Y, min_periods=1, closed='left').mean()
@@ -388,57 +166,55 @@ def get_metrics_from_csv(file_path):
         st.error(f"[{file_path}] 读取或处理数据失败: {e}")
         return None
 
-# V22.0: 重命名并改进盈亏计算，基于精确的总成本
-def calculate_index_pl_metrics(s, current_close_index, df_full):
-    """
-    V22.0: 计算单个指数的平均成本和浮动盈亏。
-    使用精确的 total_cost 和 holdings 计算平均成本。
-    """
-    total_units = s.get('holdings', 0.0)
-    total_cost = s.get('total_cost', 0.0)
-
-    if total_units == 0:
-        return np.nan, np.nan, np.nan  # avg_cost, floating_pl_pct, total_market_value
-
-    # 1. 计算平均成本
-    avg_cost = total_cost / total_units
-
-    # 2. 估算当前市场价值 (使用最新的 ETF 价格)
+def calculate_portfolio_metrics(s, current_close_index):
+    """计算平均成本和浮动盈亏 (使用 ETF 实际价格估算)"""
+    buy_records = [t for t in s['history'] if t['type'] == '买入' and 'price' in t and t['price'] is not None]
     
-    # 查找最近一次操作的 ETF 成交价和对应的指数点位
-    last_trade = next((t for t in reversed(s['history']) if t.get('price') is not None and t.get('close') is not None), None)
+    if not buy_records:
+        return np.nan, np.nan 
 
-    if last_trade and last_trade['close'] > 0:
-        last_trade_etf_price = last_trade['price']
-        last_trade_index_close = last_trade['close']
-        
-        # 核心假设：ETF价格波动与指数点位波动一致
-        estimated_current_etf_price = last_trade_etf_price * (current_close_index / last_trade_index_close)
-        
-        total_market_value = estimated_current_etf_price * total_units
-        floating_pl_pct = (total_market_value / total_cost) - 1
-        
-        return avg_cost, floating_pl_pct, total_market_value
+    total_cost = sum(t['price'] * t['unit'] for t in buy_records)
+    total_units_bought = sum(t['unit'] for t in buy_records)
+    
+    avg_cost = total_cost / total_units_bought if total_units_bought > 0 else np.nan
+    
+    # 如果没有买入或当前持仓为0，盈亏无法计算
+    if s['holdings'] == 0:
+        return avg_cost, np.nan
+    if np.isnan(avg_cost):
+        return np.nan, np.nan
+    
+    # 找到最近一次买入的指数点位 (用于估算当前 ETF 价格)
+    last_buy_index_close = next((t['close'] for t in reversed(s['history']) if t.get('type') == '买入' and t.get('close') is not None), np.nan)
+    
+    if not np.isnan(last_buy_index_close) and last_buy_index_close > 0:
+        # 核心假设：ETF价格波动与指数点位波动一致，用指数点位比例估算当前 ETF 价格
+        estimated_current_etf_price = avg_cost * (current_close_index / last_buy_index_close)
+        floating_pl_pct = (estimated_current_etf_price / avg_cost) - 1
     else:
-        # 如果没有有效的交易记录来建立估算基准，则无法计算盈亏
-        return avg_cost, np.nan, np.nan
+        floating_pl_pct = np.nan 
+        
+    return avg_cost, floating_pl_pct
 
 def get_full_index_metrics(index_key, state, full_data_frames):
     """
-    V22.0: 获取单个指数的完整指标、持仓和盈亏信息，用于子页面调用。
+    获取单个指数的完整指标、持仓和盈亏信息，用于子页面调用。
+    
+    返回: dict (包含 current_pe, current_close, holdings, avg_cost, pl_pct, df_full, history)
     """
     
-    # ... (此函数保持不变，因为它是 V21.1 中的调用接口，我们只改变其调用的子函数) ...
     result = {
-        "current_pe": np.nan, "current_close": np.nan, "holdings": 0.0, 
+        "current_pe": np.nan, "current_close": np.nan, "holdings": 0, 
         "avg_cost": np.nan, "pl_pct": np.nan, "df_full": None, 
         "history": state.get(index_key, {}).get("history", [])
     }
     
     df_full = full_data_frames.get(index_key)
+    # 确保持仓是最新的
     s = state.get(index_key, {})
-    result["holdings"] = s.get("holdings", 0.0)
+    result["holdings"] = s.get("holdings", 0)
     
+    # 如果缓存中没有数据，尝试加载
     if df_full is None:
         prefix = index_key.split('.')[0]
         actual_file_path, _, _ = find_latest_data_file(prefix)
@@ -453,16 +229,13 @@ def get_full_index_metrics(index_key, state, full_data_frames):
         result["current_pe"] = df_full.iloc[-1]['pe']
         result["current_close"] = df_full.iloc[-1]['Close']
         
-        # V22.0: 调用新的盈亏计算函数
-        avg_cost, pl_pct, _ = calculate_index_pl_metrics(s, result["current_close"], df_full)
+        avg_cost, pl_pct = calculate_portfolio_metrics(s, result["current_close"])
         result["avg_cost"] = avg_cost
         result["pl_pct"] = pl_pct
         
     return result
 
 # ================= 颜色高亮函数 =================
-
-# ... (高亮函数保持不变) ...
 
 def highlight_percentile(val):
     """根据估值百分位返回背景颜色样式"""
@@ -486,9 +259,9 @@ def highlight_signal(val):
         return f'background-color: #f8d7da; color: #721c24; font-weight: bold'
     elif '数据积累中' in str(val):
          return f'background-color: #fffac0; color: #b58d09; font-weight: bold'
-    elif '跌幅不足' in str(val):
+    elif '跌幅不足 6%' in str(val):
          return 'background-color: #e0f7fa; color: #00796b; font-weight: bold' 
-    elif '限制' in str(val): 
+    elif '30天/±12%限制' in str(val): 
          return 'background-color: #e9ecef; color: #495057; font-weight: bold'
     else:
         return 'background-color: #f0f0f0; color: black;'
@@ -504,109 +277,18 @@ def highlight_pl(val):
         elif pct < 0: return 'color: #721c24; font-weight: bold' # 红色字体
         else: return ''
     except: return ''
-# ----------------------------------------------------
-# V22.2: 数据时效性校验 (调整为 30 天阈值)
-# ----------------------------------------------------
 
-def check_data_freshness():
-    """
-    检查所有配置指数的数据文件是否在合理的时效内更新。
-    返回一个字典，包含需要警告的指数名称及其原因。
-    """
-    stale_files = {}
-    
-    # 设定阈值：如果数据落后于当前日期超过 30 个日历日，则发出警告。
-    # 宽松阈值，只在数据源严重中断时提醒 (1个月)
-    freshness_threshold = datetime.now() - timedelta(days=30)
-
-    for fixed_filename_key, name in TARGETS.items():
-        prefix = fixed_filename_key.split('.')[0]
-        actual_file_path, _, _ = find_latest_data_file(prefix)
-        
-        if not actual_file_path or not os.path.exists(actual_file_path):
-            # 如果文件不存在，立即警告 (这仍然是一个严重问题)
-            stale_files[name] = "数据文件不存在。"
-            continue
-        
-        try:
-            # 尝试加载数据以获取内部最新日期
-            metrics_result = get_metrics_from_csv(actual_file_path)
-            if metrics_result:
-                df_full = metrics_result[5]
-                df_full['Date'] = pd.to_datetime(df_full['Date'])
-                
-                latest_data_date = df_full['Date'].max().normalize()
-                
-                if latest_data_date < freshness_threshold.normalize():
-                    # 只有当最新数据日期超过 30 天阈值时才发出警告
-                    stale_files[name] = f"数据已停止在 {latest_data_date.strftime('%Y-%m-%d')}。"
-            else:
-                stale_files[name] = "无法读取数据内容。"
-
-        except Exception as e:
-            # 文件存在，但读取失败，也视为需要检查
-            stale_files[name] = f"读取文件失败: {e}"
-            
-    return stale_files
-
-# ================= 页面布局（主体逻辑） (V22.0 优化) =================
+# ================= 页面布局（主体逻辑） =================
 
 st.set_page_config(page_title="指数定投看板", layout="wide", page_icon="📈")
 
-# V22.0: 初始化 Session State
-initialize_session_state()
-
-# --- 页面头部美化 ---
+# --- 页面头部美化 (添加数据更新时间) ---
 with st.container(border=True):
-    st.markdown("## 📊 智能定投看板：估值总览与策略建议 (V22.0 - 优化版)")
-    
-    # V22.0: 从 Session State 读取参数
-    MIN_INTERVAL_DAYS = get_strategy_param("MIN_INTERVAL_DAYS")
-    VOLATILITY_OVERRIDE_PCT = get_strategy_param("VOLATILITY_OVERRIDE_PCT")
-    
-    st.markdown(f"**策略限制**: 每次操作间隔需大于 **{MIN_INTERVAL_DAYS}** 天，除非 PE 波动幅度大于 **{VOLATILITY_OVERRIDE_PCT*100:.0f}%**。")
+    st.markdown("## 📊 智能定投看板：估值总览与策略建议 (V21.1 - 交易管理)")
+    st.markdown(f"**策略限制**: 每次操作间隔需大于 {MIN_INTERVAL_DAYS} 天，除非 PE 波动幅度大于 {VOLATILITY_OVERRIDE_PCT*100:.0f}%。")
 
-# --- 侧边栏和数据新鲜度检查 (V22.0 策略配置) ---
-st.sidebar.header("🕹️ 策略配置 (V22.0)")
-
-# V22.0: 策略参数化配置
-with st.sidebar.expander("⚙️ 策略参数设置"):
-    
-    MAX_UNITS = st.number_input(
-        "最大持仓份数 (MAX_UNITS):", 
-        min_value=1, value=get_strategy_param("MAX_UNITS"), step=1, key='param_max_units'
-    )
-    STEP_PERCENT = st.number_input(
-        "阶梯买入跌幅 (STEP_PERCENT, %):", 
-        min_value=1.0, max_value=20.0, value=get_strategy_param("STEP_PERCENT")*100, step=0.5, format="%.1f"
-    ) / 100
-    MIN_INTERVAL_DAYS = st.number_input(
-        "最小操作间隔 (天):", 
-        min_value=1, value=get_strategy_param("MIN_INTERVAL_DAYS"), step=1, key='param_min_days'
-    )
-    VOLATILITY_OVERRIDE_PCT = st.number_input(
-        "波动率覆盖比例 (%):", 
-        min_value=1.0, max_value=50.0, value=get_strategy_param("VOLATILITY_OVERRIDE_PCT")*100, step=1.0, format="%.0f"
-    ) / 100
-    
-    if st.button("保存策略参数并刷新", type="primary"):
-        st.session_state['strategy_params'] = {
-            "MAX_UNITS": MAX_UNITS,
-            "STEP_PERCENT": STEP_PERCENT,
-            "MIN_INTERVAL_DAYS": MIN_INTERVAL_DAYS,
-            "VOLATILITY_OVERRIDE_PCT": VOLATILITY_OVERRIDE_PCT,
-        }
-        st.success("参数已更新！")
-        st.cache_data.clear()
-        st.rerun()
-
-# V22.0: 读取最新的参数值
-MAX_UNITS = get_strategy_param("MAX_UNITS")
-STEP_PERCENT = get_strategy_param("STEP_PERCENT")
-MIN_INTERVAL_DAYS = get_strategy_param("MIN_INTERVAL_DAYS")
-VOLATILITY_OVERRIDE_PCT = get_strategy_param("VOLATILITY_OVERRIDE_PCT")
-
-
+# --- 侧边栏和数据新鲜度检查 ---
+st.sidebar.header("🕹️ 操作面板")
 st.sidebar.info(f"数据目录: **{DATA_DIR}/**")
 
 # 查找最新的数据文件，获取更新时间
@@ -622,9 +304,10 @@ if latest_modified_time:
 else:
     st.sidebar.warning("⚠️ 找不到数据文件，请检查 index_data 文件夹。")
 
-# V22.0: 加载状态，并重新计算持仓和成本 (重要步骤)
+# 加载状态 (重要: 运行时会重新计算 holdings)
 state = load_state()
-state = recalculate_holdings_and_cost(state)
+state = recalculate_holdings(state)
+# 首次运行或 state 变更后保存，确保 holdings 正确
 # save_state(state) # 避免在 rerurn 之前重复保存
 
 # 主数据表格构建
@@ -635,7 +318,7 @@ progress_bar = st.progress(0, text="计算中...")
 total_targets = len(TARGETS)
 full_data_frames = {} 
 
-# --- 大盘整体仓位指标计算 (保持不变) ---
+# --- 大盘整体仓位指标计算 ---
 overall_position_pct = 0
 overall_pe_percentile = np.nan
 
@@ -666,10 +349,6 @@ for i, (fixed_filename_key, name) in enumerate(TARGETS.items()):
     code = fixed_filename_key
     s = state[code]
     current_holdings = s["holdings"]
-    
-    # V22.0: 从状态中直接读取总成本
-    current_total_cost = s["total_cost"]
-    
     days_since_last_op_display = '—'
     avg_cost_display = '—'
     pl_pct_display = '—'
@@ -682,18 +361,18 @@ for i, (fixed_filename_key, name) in enumerate(TARGETS.items()):
         
         full_data_frames[fixed_filename_key] = df_full 
 
-        # --- V22.0: 自动回填缺失数据 (使用改进的 find_pe_by_date) ---
+        # --- 自动回填缺失数据 ---
         for trade in s['history']:
-            if trade['pe'] is None or trade['close'] is None or np.isnan(trade.get('pe', np.nan)):
+            if trade['pe'] is None or trade['close'] is None:
                 new_pe, new_close = find_pe_by_date(df_full, trade['date'])
                 if not np.isnan(new_pe) and not np.isnan(new_close):
                     trade['pe'] = round(new_pe, 2)
                     trade['close'] = round(new_close, 2)
                     updated_records_count += 1
         
-        # --- V22.0: P&L 计算 (使用新的 calculate_index_pl_metrics) ---
+        # --- P&L 计算 ---
         current_close_index = df_full.iloc[-1]['Close']
-        avg_cost, pl_pct, _ = calculate_index_pl_metrics(s, current_close_index, df_full)
+        avg_cost, pl_pct = calculate_portfolio_metrics(s, current_close_index)
 
         if not np.isnan(avg_cost):
             avg_cost_display = f"{avg_cost:.4f}"
@@ -704,7 +383,6 @@ for i, (fixed_filename_key, name) in enumerate(TARGETS.items()):
         last_op = s["history"][-1] if s["history"] else None
         time_limit_suppression = False
         
-        # ... (此处逻辑与 V21.1 保持一致，但使用 V22.0 的动态参数) ...
         if last_op and 'pe' in last_op and last_op['pe'] is not None and not np.isnan(last_op['pe']):
             last_op_date_str = last_op.get("date", datetime.now().strftime("%Y-%m-%d"))
             last_op_date = datetime.strptime(last_op_date_str, "%Y-%m-%d").date()
@@ -743,7 +421,7 @@ for i, (fixed_filename_key, name) in enumerate(TARGETS.items()):
         diff_pct = (curr_pe - benchmark_pe) / benchmark_pe * 100 if benchmark_pe > 0 else np.nan
         signal = "观望"
         
-        # ==================== 信号判断逻辑 (含决策日志 - V22.0 使用动态参数) ====================
+        # ==================== 信号判断逻辑 (含决策日志) ====================
         current_decision_log.append("--- 策略评估 ---")
 
         if benchmark_pe == 0 or np.isnan(benchmark_pe):
@@ -776,17 +454,16 @@ for i, (fixed_filename_key, name) in enumerate(TARGETS.items()):
                 
                 suppress_by_step = False
                 if current_holdings > 0 and last_buy_pe is not None:
-                    # V22.0: 使用动态 STEP_PERCENT
                     required_entry_pe = last_buy_pe * (1 - STEP_PERCENT)
                     current_decision_log.append(f"阶梯买入检查: 上次买入PE {last_buy_pe:.2f}, 下次买入PE阈值 {required_entry_pe:.2f} (要求跌幅 ≥ {STEP_PERCENT*100:.0f}%)。")
                     if curr_pe > required_entry_pe:
                         suppress_by_step = True
-                        current_decision_log.append(f"结果: 跌幅不足 {STEP_PERCENT*100:.0f}%，抑制买入。")
+                        current_decision_log.append("结果: 跌幅不足 6%，抑制买入。")
                 else:
                     current_decision_log.append(f"阶梯买入检查: 无持仓或无上次买入PE，不检查跌幅限制。")
                         
                 if suppress_by_step:
-                    signal = f"⏸️ 观望 (跌幅不足 {STEP_PERCENT*100:.0f}%)"
+                    signal = "⏸️ 观望 (跌幅不足 6%)"
                 elif current_holdings < MAX_UNITS:
                     signal = "🟢 建议买入"
                     current_decision_log.append("结果: 建议买入。")
@@ -807,12 +484,11 @@ for i, (fixed_filename_key, name) in enumerate(TARGETS.items()):
             "上次操作距今(天)": days_since_last_op_display,
             "平均成本(ETF)": avg_cost_display,
             "浮动盈亏(%)": pl_pct_display,
-            "当前持仓(份)": f"{current_holdings:.1f}", # V22.0: 允许小数显示
+            "当前持仓(份)": current_holdings,
             "上次操作日期": last_date, 
             "上次操作PE": f"{last_pe:.2f}" if not np.isnan(last_pe) else '—', 
         })
     else:
-        # ... (数据加载失败处理保持不变) ...
         decision_logs[code] = ["数据处理失败或文件缺失，无法评估策略。"]
         table_data.append({
             "指数名称": name, 
@@ -820,21 +496,18 @@ for i, (fixed_filename_key, name) in enumerate(TARGETS.items()):
             "PE分位点": "—", "偏离度(3年%)": "—", "当前PE": "—", 
             "上次操作距今(天)": '—',
             "平均成本(ETF)": '—', "浮动盈亏(%)": '—',
-            "当前持仓(份)": f"{s['holdings']:.1f}", 
-            "上次操作日期": last_date, "上次操作PE": "—"
+            "当前持仓(份)": s["holdings"], "上次操作日期": last_date, "上次操作PE": "—"
         })
 
 progress_bar.empty()
 
-# --- 检查是否需要保存状态和重新运行 (V22.0 优化) ---
+# --- 检查是否需要保存状态和重新运行 ---
 if updated_records_count > 0:
-    save_state(state) # 仅保存历史记录，持仓和成本已在 load 时重新计算
+    save_state(state)
     st.success(f"✅ 已自动补录 {updated_records_count} 条交易记录的 PE/点位数据!")
     st.cache_data.clear() 
     time.sleep(1)
     st.rerun()
-
-# ... (核心指标显示区保持不变) ...
 
 # --- 核心指标显示区 (顶部增加整体仓位指标) ---
 st.subheader("核心指标")
@@ -885,7 +558,6 @@ st.dataframe(
     height=500
 )
 
-
 # --- 详细的决策依据显示 (扩展到所有指数) ---
 st.markdown("---")
 st.subheader("🔍 详细决策依据 (所有指数)")
@@ -903,9 +575,9 @@ st.header("🛒 交易登记与管理")
 
 tab_record, tab_manage = st.tabs(["📝 登记新交易", "🗑️ 管理/修改交易记录"])
 
-# ======================= Tab 1: 登记新交易 (V22.0 优化) =======================
+# ======================= Tab 1: 登记新交易 =======================
 with tab_record:
-    st.markdown(f"每次默认操作 **1 份**。当前最大持仓限制：**{MAX_UNITS}** 份。")
+    st.markdown("登记新的买入或卖出记录。")
     with st.container(border=True):
         col1, col2, col3, col4, col5 = st.columns([2, 1, 2, 2, 2])
 
@@ -914,7 +586,6 @@ with tab_record:
         with col1:
             selected_name_r = st.selectbox("选择指数", name_options, key="select_record_index")
             selected_file_r = [f for f, n in TARGETS.items() if n == selected_name_r][0]
-            current_holdings_r = state[selected_file_r]['holdings']
 
         with col2:
             action_r = st.selectbox("操作类型", ["买入", "卖出"], key="select_action")
@@ -924,8 +595,12 @@ with tab_record:
             trade_date_str_r = trade_date_r.strftime("%Y-%m-%d")
 
         with col4:
-            trade_price_r = st.number_input("ETF 实际成交价格", min_value=0.0001, format="%.4f", value=1.0000, step=0.0001, key="input_price")
-            trade_unit_r = st.number_input("交易份数", min_value=1, value=1, step=1, key="input_unit")
+            price_label_r = "ETF 实际成交价格"
+            
+            # 尝试获取最近的交易价格作为默认值
+            last_buy_price_r = next((t['price'] for t in reversed(state[selected_file_r]['history']) if t.get('type') == '买入' and t.get('price') is not None), 1.0000)
+            
+            trade_price_r = st.number_input(price_label_r, min_value=0.0001, format="%.4f", value=last_buy_price_r, step=0.0001, key="input_price")
 
         with col5:
             st.markdown("##### ") 
@@ -935,16 +610,17 @@ with tab_record:
                 df_selected_r = full_data_frames.get(selected_file_r)
                 
                 if df_selected_r is None:
-                    st.error(f"⚠️ 无法提交记录：数据文件 {selected_file_r} 读取失败。请稍后重试。")
+                    st.error(f"⚠️ 无法提交记录：数据文件 {selected_file_r} 读取失败。")
                     time.sleep(1); st.cache_data.clear(); st.rerun()
 
-                # V22.0: 使用改进的 find_pe_by_date
                 trade_pe_r, trade_close_r = find_pe_by_date(df_selected_r, trade_date_str_r)
                 
                 saved_pe_r = round(trade_pe_r, 2) if not np.isnan(trade_pe_r) else None
                 saved_close_r = round(trade_close_r, 2) if not np.isnan(trade_close_r) else None
                 
-                pe_display_str_r = f"{saved_pe_r:.2f}" if saved_pe_r is not None else 'N/A'
+                is_data_missing_r = saved_pe_r is None or saved_close_r is None
+                
+                pe_display_str_r = f"{saved_pe_r:.2f}" if not is_data_missing_r else 'N/A'
                     
                 transaction_r = {
                     "date": trade_date_str_r,
@@ -952,139 +628,140 @@ with tab_record:
                     "pe": saved_pe_r, 
                     "close": saved_close_r,
                     "price": trade_price_r, 
-                    "unit": trade_unit_r
+                    "unit": 1 # 默认每次交易一份
                 }
                 
                 if action_r == "买入":
-                    if current_holdings_r + trade_unit_r <= MAX_UNITS:
+                    if s["holdings"] < MAX_UNITS:
                         s["history"].append(transaction_r) 
-                        state = recalculate_holdings_and_cost(state) # 立即重新计算
                         save_state(state)
-                        st.success(f"已记录：{selected_name_r} 买入{trade_unit_r}份。PE: {pe_display_str_r}, ETF成交价: {trade_price_r:.4f}。当前持仓 {state[selected_file_r]['holdings']:.1f} 份。")
+                        st.success(f"已记录：{selected_name_r} 买入1份。PE: {pe_display_str_r}, ETF成交价: {trade_price_r:.4f}。当前持仓 {state[selected_file_r]['holdings']} 份。")
                     else:
-                        st.info(f"超过最大持仓份数 ({MAX_UNITS})，本次买入 {trade_unit_r} 份后将超限。")
+                        st.info(f"已达到最大持仓份数 ({MAX_UNITS})，无法继续买入。")
                     
                 elif action_r == "卖出":
-                    if current_holdings_r >= trade_unit_r:
+                    if s["holdings"] > 0:
                         s["history"].append(transaction_r) 
-                        state = recalculate_holdings_and_cost(state) # 立即重新计算
                         save_state(state)
-                        st.warning(f"已记录：{selected_name_r} 卖出{trade_unit_r}份。PE: {pe_display_str_r}, ETF成交价: {trade_price_r:.4f}。当前持仓 {state[selected_file_r]['holdings']:.1f} 份。")
+                        st.warning(f"已记录：{selected_name_r} 卖出1份。PE: {pe_display_str_r}, ETF成交价: {trade_price_r:.4f}。当前持仓 {state[selected_file_r]['holdings']} 份。")
                     else:
-                        st.error(f"持仓不足。当前持仓 {current_holdings_r:.1f} 份，无法卖出 {trade_unit_r} 份。")
+                        st.error("持仓为0，无法卖出。")
                         
                 time.sleep(1)
                 st.cache_data.clear() 
                 st.rerun()
 
-# --- 交易登记逻辑 (新增交易管理 - V23.1 切换为 Sheets) ---
-st.markdown("---")
-st.header("🛒 交易登记与管理 (Google Sheets 模式)")
+# ======================= Tab 2: 管理/修改交易记录 =======================
+with tab_manage:
+    st.markdown("⚠️ **危险操作！** 删除和修改记录将直接影响持仓和成本计算。")
 
-# V23.1: 仅保留登记 Tab，因为修改/删除功能应直接在 Google Sheets 中操作
-tab_record = st.tabs(["📝 登记新交易"])[0] 
-
-# 从 state 中获取当前选定指数的持仓信息
-
-with tab_record:
+    name_options_m = list(TARGETS.values())
+    selected_name_m = st.selectbox("选择要管理记录的指数", name_options_m, key="select_manage_index")
+    selected_file_m = [f for f, n in TARGETS.items() if n == selected_name_m][0]
     
-    # --- 登记交易表单 ---
-    with st.form("new_trade_form"):
-        col_select, col_type, col_date = st.columns(3)
-        
-        name_options = list(TARGETS.values())
-        
-        with col_select:
-            # V23.1: 简化选择逻辑
-            trade_index_name = st.selectbox("选择交易指数", name_options, key='trade_index_select')
-            # 查找交易指数的文件名键
-            trade_key = next(k for k, v in TARGETS.items() if v == trade_index_name)
-            current_holdings = state[trade_key]['holdings']
-            # 显示当前持仓，使用户可以判断是否超限
-            st.markdown(f"**当前持仓:** `{current_holdings:.1f} 份 (上限: {MAX_UNITS} 份)`")
-
-        with col_type:
-            trade_type = st.radio("操作类型", ["买入", "卖出"], horizontal=True)
-            
-        with col_date:
-            trade_date = st.date_input("交易日期", datetime.now().date(), max_value=datetime.now().date())
-        
-        col_p, col_u = st.columns(2)
-        with col_p:
-            trade_price = st.number_input("交易价格 (ETF净值/单位)", min_value=0.01, format="%.4f")
-        with col_u:
-            # 允许输入非整数份数
-            trade_unit = st.number_input("交易份数 (1000元/份)", min_value=0.01, format="%.2f")
-
-        submitted = st.form_submit_button("记录交易并更新 (写入 Sheets)")
-
-        if submitted:
-            
-            # --- 交易前的逻辑检查 ---
-            if trade_type == "买入" and current_holdings + trade_unit > MAX_UNITS:
-                st.error(f"⚠️ 超过最大持仓份数限制 ({MAX_UNITS} 份)。请调整份数。")
-                st.stop()
-            
-            if trade_type == "卖出" and trade_unit > current_holdings:
-                st.error(f"⚠️ 现有持仓不足 ({current_holdings:.1f} 份)。无法卖出 {trade_unit} 份。")
-                st.stop()
-                
-            # --- 实际交易逻辑 (Sheets 写入) ---
-            
-            # 1. 查找最新的收盘价，作为写入 Sheets 的估值基准
-            trade_data_metrics = get_full_index_metrics(trade_key, state, full_data_frames={})
-            latest_close = trade_data_metrics.get('current_close', trade_price) # 兜底使用交易价格
-
-            st.info(f"正在将 {trade_index_name} 的 {trade_type} 交易记录写入 Google Sheets...")
-            
-            # V23.1: 调用 Sheets 写入函数
-            state = add_transaction(
-                state, 
-                trade_key, 
-                trade_type, 
-                datetime.combine(trade_date, datetime.min.time()), # 转换为 datetime 对象
-                trade_price, 
-                trade_unit, 
-                latest_close
-            )
-            
-st.markdown("---")
-st.subheader("历史交易记录 (来自 Google Sheets)")
-
-# 确保选择了一个指数来显示历史记录
-if 'trade_index_select' in st.session_state and st.session_state.trade_index_select:
-    selected_name = st.session_state.trade_index_select
-    selected_file = next(f for f, n in TARGETS.items() if n == selected_name)
-    holding_info = state[selected_file]
+    s_m = state[selected_file_m]
     
-    # 显示历史交易记录 (从 Sheets 加载)
-    if holding_info['history']:
-        # 确保 history 中的 date 是 str，以便于 DataFrame 转换
-        df_history = pd.DataFrame([
-            # 确保日期是字符串格式，PE/Close是数字
-            {**h, 'date': h['date'].strftime('%Y-%m-%d'), 
-             'pe': h.get('pe', np.nan), 'close': h.get('close', np.nan)}
-            for h in holding_info['history']
-        ])
-        
-        # 仅显示用户关注的字段
-        df_display_history = df_history[['date', 'type', 'price', 'unit', 'pe', 'close']].copy()
-        df_display_history = df_display_history.rename(columns={
-            'date': '成交日期', 'type': '操作类型', 'price': 'ETF成交价', 
-            'unit': '交易份数', 'pe': '成交PE(自动)', 'close': '成交点位(自动)'
-        })
-        
-        st.dataframe(
-            df_display_history.style.format({
-                'ETF成交价': "¥ {:.4f}", 
-                '交易份数': "{:.2f}",
-                '成交PE(自动)': "{:.2f}",
-                '成交点位(自动)': "{:.2f}"
-            }),
-            use_container_width=True,
-            hide_index=True
-        )
+    if not s_m['history']:
+        st.info("该指数尚无交易记录可供管理。")
     else:
-        st.info(f"当前 {selected_name} 没有交易记录。")
-else:
-    st.info("请在上方选择一个指数以查看其历史交易记录。")
+        # 将历史记录转换为 DataFrame 以便展示索引
+        history_df_m = pd.DataFrame(s_m['history'])
+        history_df_m['index'] = history_df_m.index # 添加索引列用于识别记录
+        
+        # 简化 DataFrame 以供 Streamlit 展示
+        df_display_m = history_df_m[['index', 'date', 'type', 'price', 'unit', 'pe', 'close']].copy()
+        df_display_m = df_display_m.rename(columns={'index': '索引', 'date': '成交日期', 'type': '操作类型', 'price': 'ETF成交价', 'unit': '交易份数', 'pe': '成交PE(自动)', 'close': '成交点位(自动)'})
+        
+        # 格式化 PE/Close/Price，防止 NaN 显示问题
+        for col in ['ETF成交价', '成交PE(自动)', '成交点位(自动)']:
+             if col in df_display_m.columns:
+                if col == 'ETF成交价':
+                    df_display_m[col] = df_display_m[col].apply(lambda x: f"{x:.4f}" if pd.notna(x) and x is not None else 'N/A')
+                else:
+                    df_display_m[col] = df_display_m[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) and x is not None else 'N/A')
+        
+        st.dataframe(df_display_m, use_container_width=True)
+
+        # --- 删除操作 ---
+        st.subheader("删除记录")
+        col_del, col_button_del = st.columns([1, 1])
+        with col_del:
+            index_to_delete = st.number_input("输入要删除的记录行索引 (最左侧列)", min_value=0, max_value=len(history_df_m) - 1, step=1, key="delete_index")
+        
+        with col_button_del:
+            st.markdown("##### ")
+            if st.button(f"🔴 确认删除第 {index_to_delete} 行记录", key="confirm_delete_button"):
+                # 确保索引有效
+                if 0 <= index_to_delete < len(s_m['history']):
+                    del s_m['history'][index_to_delete]
+                    save_state(state)
+                    st.success(f"✅ 记录 {index_to_delete} 已删除，持仓已重新计算。")
+                    time.sleep(1)
+                    st.cache_data.clear() 
+                    st.rerun()
+                else:
+                    st.error("索引超出范围，请检查输入。")
+
+        st.markdown("---")
+        
+        # --- 修改操作 (仅支持修改价格/日期/类型/份数) ---
+        st.subheader("修改记录")
+        
+        df_selected_m = full_data_frames.get(selected_file_m)
+        if df_selected_m is None:
+            st.error("无法获取指数数据，无法进行修改。请确保数据文件存在。")
+        else:
+            col_mod_index, col_mod_type, col_mod_date, col_mod_price = st.columns(4)
+            
+            # 1. 选择要修改的索引
+            with col_mod_index:
+                index_to_modify = st.number_input("输入要修改的记录行索引", min_value=0, max_value=len(history_df_m) - 1, step=1, key="modify_index")
+            
+            # 确保索引有效
+            if 0 <= index_to_modify < len(s_m['history']):
+                record_to_modify = s_m['history'][index_to_modify]
+                
+                # 2. 修改操作类型
+                with col_mod_type:
+                    new_type = st.selectbox("新操作类型", ["买入", "卖出"], index=0 if record_to_modify.get('type') == '买入' else 1, key="modify_type")
+
+                # 3. 修改成交日期
+                with col_mod_date:
+                    try:
+                        current_date = datetime.strptime(record_to_modify.get('date'), "%Y-%m-%d").date()
+                    except:
+                         current_date = datetime.now().date()
+                    new_date = st.date_input("新成交日期", value=current_date, max_value=datetime.now().date(), key="modify_date")
+                    new_date_str = new_date.strftime("%Y-%m-%d")
+
+                # 4. 修改 ETF 价格
+                with col_mod_price:
+                    new_price = st.number_input("新ETF成交价", min_value=0.0001, format="%.4f", value=record_to_modify.get('price', 1.0000), step=0.0001, key="modify_price")
+                    
+                # 5. 修改份数 (默认为 1)
+                new_unit = st.number_input("新交易份数", min_value=1, value=record_to_modify.get('unit', 1), step=1, key="modify_unit")
+
+                if st.button(f"🟡 确认修改第 {index_to_modify} 行记录", key="confirm_modify_button"):
+                    
+                    # 重新查找新的 PE/Close
+                    trade_pe_mod, trade_close_mod = find_pe_by_date(df_selected_m, new_date_str)
+                    saved_pe_mod = round(trade_pe_mod, 2) if not np.isnan(trade_pe_mod) else None
+                    saved_close_mod = round(trade_close_mod, 2) if not np.isnan(trade_close_mod) else None
+
+                    # 更新记录
+                    s_m['history'][index_to_modify] = {
+                        "date": new_date_str,
+                        "type": new_type,
+                        "pe": saved_pe_mod, 
+                        "close": saved_close_mod,
+                        "price": new_price, 
+                        "unit": new_unit
+                    }
+
+                    save_state(state)
+                    st.success(f"✅ 记录 {index_to_modify} 已更新并重新计算持仓。")
+                    time.sleep(1)
+                    st.cache_data.clear() 
+                    st.rerun()
+            else:
+                st.error("索引超出范围，请检查输入。")
