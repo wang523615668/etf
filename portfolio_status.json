@@ -1,0 +1,110 @@
+{
+    "大盘.csv": {
+        "holdings": 0.0,
+        "last_action_date": "2025-11-28",
+        "last_action_pe": 27.8076,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "沪深300.csv": {
+        "holdings": 0.0,
+        "last_action_date": "1900-01-01",
+        "last_action_pe": NaN,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "中证500.csv": {
+        "holdings": 0.0,
+        "last_action_date": "1900-01-01",
+        "last_action_pe": NaN,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "全指医药.csv": {
+        "holdings": 2.0,
+        "history": [
+            {
+                "date": "2025-09-10",
+                "type": "买入",
+                "pe": 25.8,
+                "close": 10103.15,
+                "price": 1.0,
+                "unit": 1
+            },
+            {
+                "date": "2025-10-16",
+                "type": "买入",
+                "pe": 25.13,
+                "close": 9638.35,
+                "price": 1.1,
+                "unit": 1
+            }
+        ],
+        "total_cost": 2.1
+    },
+    "上证50.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "创业板指数.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "养老产业.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "中证红利.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "中证环保.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "中证传媒.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "全指金融.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "证券公司.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "全指消费.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "全指信息.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "中证医疗.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "中证白酒.csv": {
+        "holdings": 0.0,
+        "history": [],
+        "total_cost": 0.0
+    },
+    "创业板指.csv": {
+        "holdings": 0.0,
+        "total_cost": 0.0,
+        "history": []
+    }
+}
