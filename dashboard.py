@@ -789,7 +789,50 @@ with tab_record:
                 time.sleep(1)
                 st.cache_data.clear() 
                 st.rerun()
+# ----------------------------------------------------
+# V22.2: 数据时效性校验 (调整为 30 天阈值)
+# ----------------------------------------------------
 
+def check_data_freshness():
+    """
+    检查所有配置指数的数据文件是否在合理的时效内更新。
+    返回一个字典，包含需要警告的指数名称及其原因。
+    """
+    stale_files = {}
+    
+    # 设定阈值：如果数据落后于当前日期超过 30 个日历日，则发出警告。
+    # 宽松阈值，只在数据源严重中断时提醒 (1个月)
+    freshness_threshold = datetime.now() - timedelta(days=30)
+
+    for fixed_filename_key, name in TARGETS.items():
+        prefix = fixed_filename_key.split('.')[0]
+        actual_file_path, _, _ = find_latest_data_file(prefix)
+        
+        if not actual_file_path or not os.path.exists(actual_file_path):
+            # 如果文件不存在，立即警告 (这仍然是一个严重问题)
+            stale_files[name] = "数据文件不存在。"
+            continue
+        
+        try:
+            # 尝试加载数据以获取内部最新日期
+            metrics_result = get_metrics_from_csv(actual_file_path)
+            if metrics_result:
+                df_full = metrics_result[5]
+                df_full['Date'] = pd.to_datetime(df_full['Date'])
+                
+                latest_data_date = df_full['Date'].max().normalize()
+                
+                if latest_data_date < freshness_threshold.normalize():
+                    # 只有当最新数据日期超过 30 天阈值时才发出警告
+                    stale_files[name] = f"数据已停止在 {latest_data_date.strftime('%Y-%m-%d')}。"
+            else:
+                stale_files[name] = "无法读取数据内容。"
+
+        except Exception as e:
+            # 文件存在，但读取失败，也视为需要检查
+            stale_files[name] = f"读取文件失败: {e}"
+            
+    return stale_files
 # ======================= Tab 2: 管理/修改交易记录 (V22.0 优化) =======================
 with tab_manage:
     st.markdown("⚠️ **危险操作！** 删除和修改记录将直接影响持仓和成本计算。")
