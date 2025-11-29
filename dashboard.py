@@ -33,19 +33,34 @@ TARGETS = {
     "中证白酒.csv": "中证白酒",
 }
 
+STRATEGY_PARAMS = {
+    # 策略 1: 3年平均PE偏离度阈值
+    "BUY_DEVIATION_PCT": -0.10,  # 低于平均 PE 10% (即 -0.10)
+    "SELL_DEVIATION_PCT": 0.30, # 高于平均 PE 30% (即 +0.30)
+}
+
 DATA_DIR = "index_data"
 STATE_FILE = "portfolio_status.json"
 
-# V22.0: 策略参数不再硬编码，它们将在 Streamlit Session State 中初始化。
-# 初始默认值，用于首次加载 Session State
+# V23.2: 资金/份数固定金额配置
+FIXED_AMOUNT_PER_PORTION = 300.0 # 每份固定金额# 初始默认值，用于首次加载 Session State
 DEFAULT_STRATEGY_PARAMS = {
-    "MAX_UNITS": 10,                 # 最大买入份数
+    "MAX_UNITS": 150,                 # 最大买入份数 (现在是总份数 150 份)
     "STEP_PERCENT": 0.06,            # 阶梯买入跌幅 (6%)
     "MIN_INTERVAL_DAYS": 30,         # 最小操作间隔天数 (30天)
     "VOLATILITY_OVERRIDE_PCT": 0.12, # 波动率限制覆盖比例 (12%)
 }
+MAX_UNITS_DEFAULT = DEFAULT_STRATEGY_PARAMS["MAX_UNITS"]
+MIN_INTERVAL_DAYS = DEFAULT_STRATEGY_PARAMS["MIN_INTERVAL_DAYS"]
+VOLATILITY_OVERRIDE_PCT = DEFAULT_STRATEGY_PARAMS["VOLATILITY_OVERRIDE_PCT"]
 
-# ================= 状态与策略函数 (V22.0 优化) =================
+# V23.3: 资金/份数固定金额配置
+FIXED_AMOUNT_PER_PORTION = 300.0 # 每份固定金额
+
+
+# ====================================================================
+# 核心状态函数 (V23.3: 引入 portions 字段)
+# ====================================================================
 
 def initialize_session_state():
     """初始化 Streamlit Session State，包括策略参数。"""
@@ -57,10 +72,11 @@ def get_strategy_param(key):
     initialize_session_state()
     return st.session_state['strategy_params'].get(key, DEFAULT_STRATEGY_PARAMS.get(key))
 
-# V22.0: 优化 load_state/save_state 流程，包含精确的成本和持仓。
+
 def load_state():
-    """加载本地持仓状态，并确保结构完整。"""
-    initial_state = {code: {"holdings": 0, "total_cost": 0.0, "history": []} for code in TARGETS.keys()}
+    """V23.3: 加载本地持仓状态，并确保结构完整（新增 portions_held 字段）。"""
+    # V23.3: 新增 portions_held 字段
+    initial_state = {code: {"holdings": 0.0, "total_cost": 0.0, "portions_held": 0.0, "history": []} for code in TARGETS.keys()}
     
     if os.path.exists(STATE_FILE):
         try:
@@ -70,25 +86,82 @@ def load_state():
                  if code not in state:
                     state[code] = initial_state[code]
                  else:
-                    # V22.0: 确保 total_cost 字段存在
-                    if "total_cost" not in state[code]:
-                        state[code]["total_cost"] = 0.0 
-                    if "holdings" not in state[code]:
-                        state[code]["holdings"] = 0
-                    if "history" not in state[code]:
-                        state[code]["history"] = []
-            return state
-        except json.JSONDecodeError:
-            print("警告: 状态文件损坏，已重置。")
+                    # 兼容性检查：确保所有关键字段都存在
+                    if "total_cost" not in state[code]: state[code]["total_cost"] = 0.0 
+                    if "holdings" not in state[code]: state[code]["holdings"] = 0.0
+                    if "portions_held" not in state[code]: state[code]["portions_held"] = 0.0 # V23.3 新增
+                    if "history" not in state[code]: state[code]["history"] = []
+                    
+                    # 确保 history 记录中包含 'portions' 字段
+                    for h in state[code]["history"]:
+                        if "portions" not in h:
+                            # 估算旧记录的 portions：如果 price/unit 存在，则 portions = (price * unit) / FIXED_AMOUNT_PER_PORTION
+                            if h.get('price') and h.get('unit'):
+                                h['portions'] = round((h['price'] * h['unit']) / FIXED_AMOUNT_PER_PORTION, 0)
+                            else:
+                                h['portions'] = 0 # 无法估算
+                        # 确保 fund_name 存在
+                        if "fund_name" not in h:
+                             h['fund_name'] = ""
+                             
+            return recalculate_holdings_and_cost(state) # 重新计算一次，以防万一
+        except json.JSONDecodeError as e:
+            st.error(f"警告: 状态文件损坏，已重置。错误: {e}")
             return initial_state
             
     return initial_state
 
+
 def save_state(state):
-    """保存本地持仓状态 (在保存前已调用 recalculate_holdings_and_cost)"""
-    # V22.0: 在这里不调用 recalculate_holdings_and_cost，避免在循环中重复计算
-    with open(STATE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(state, f, ensure_ascii=False, indent=4)
+    """将当前状态保存到本地 JSON 文件。"""
+    try:
+        # V22.0: 在保存前，确保 history 中的 date 是字符串格式
+        state_to_save = {}
+        for k, data in state.items():
+            data_to_save = data.copy()
+            if 'history' in data_to_save:
+                data_to_save['history'] = [
+                    {**h, 'date': h['date'].strftime('%Y-%m-%d') if hasattr(h['date'], 'strftime') else h['date']}
+                    for h in data_to_save['history']
+                ]
+            state_to_save[k] = data_to_save
+            
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state_to_save, f, ensure_ascii=False, indent=4)
+        return True
+    except Exception as e:
+        st.error(f"保存状态到 {STATE_FILE} 失败。错误: {e}")
+        return False
+
+
+def calculate_total_portions(history):
+    """V23.3: 根据历史记录中新增的 'portions' 字段计算当前持有的总份数。"""
+    total_portions = 0.0
+    for transaction in history:
+        # 兼容性说明: 交易记录必须包含 portions 字段
+        portions = transaction.get('portions', 0.0) 
+        
+        if transaction.get('type') == '买入':
+            total_portions += portions
+        elif transaction.get('type') == '卖出':
+            total_portions -= portions
+    return max(0.0, total_portions)
+
+
+def recalculate_holdings_and_cost(state):
+    """V23.3: 遍历所有指数，重新计算并更新状态中的持仓、总成本和总份数。"""
+    for code, data in state.items():
+        if 'history' in data:
+            # 1. 计算基金份额和总成本（使用旧的 calculate_index_cost）
+            total_units, total_cost = calculate_index_cost(data['history'])
+            
+            # 2. 计算份数（使用新的 calculate_total_portions）
+            total_portions = calculate_total_portions(data['history']) 
+            
+            state[code]['holdings'] = total_units # 仍是基金份额
+            state[code]['total_cost'] = total_cost
+            state[code]['portions_held'] = total_portions # V23.3 新增字段保存总份数
+    return state
 
 def calculate_index_cost(history):
     """
@@ -121,13 +194,29 @@ def calculate_index_cost(history):
             
     return max(0.0, total_units), max(0.0, total_cost)
 
+def calculate_total_portions(history):
+    """V23.2: 根据历史记录中新增的 'portions' 字段计算当前持有的总份数。"""
+    total_portions = 0.0
+    for transaction in history:
+        # 兼容性说明: 假设旧的记录没有 portions 字段，如果强制要求，需要手动更新 JSON 文件。
+        # 此处我们只计算包含 portions 字段的新记录。
+        portions = transaction.get('portions', 0.0) 
+        
+        if transaction.get('type') == '买入':
+            total_portions += portions
+        elif transaction.get('type') == '卖出':
+            total_portions -= portions
+    return max(0.0, total_portions)
+
 def recalculate_holdings_and_cost(state):
-    """V22.0: 遍历所有指数，重新计算并更新状态中的持仓和总成本。"""
+    """V23.2: 遍历所有指数，重新计算并更新状态中的持仓、总成本和总份数。"""
     for code, data in state.items():
         if 'history' in data:
             total_units, total_cost = calculate_index_cost(data['history'])
-            state[code]['holdings'] = total_units
+            total_portions = calculate_total_portions(data['history']) # V23.2 新增
+            state[code]['holdings'] = total_units # 仍是基金份额
             state[code]['total_cost'] = total_cost
+            state[code]['portions_held'] = total_portions # 新增字段保存总份数
     return state
 
 # ================= 核心数据处理函数 (V22.0 优化) =================
@@ -317,6 +406,123 @@ def get_full_index_metrics(index_key, state, full_data_frames):
         
     return result
 
+
+# dashboard.py - 新增 calculate_n_year_avg_pe (V25.1)
+
+# 请确保文件顶部有 from datetime import timedelta 导入
+
+def calculate_n_year_avg_pe(df_full, years, current_date=None):
+    """
+    V25.1: 计算基于日期的 N 年平均 PE，并返回最大/最小偏离度。
+    严格按日期计算，不依赖于数据点的数量。
+    返回: avg_pe, max_dev_pct, min_dev_pct
+    """
+    if df_full.empty or 'PE_TTM' not in df_full.columns:
+        return np.nan, np.nan, np.nan
+
+    if current_date is None:
+        current_date = df_full.index.max()
+
+    # 严格按日期计算 N 年的起始日期
+    start_date = current_date - timedelta(days=int(years * 365.25))
+    
+    # 筛选 N 年内的数据 (按日期)
+    df_n_year = df_full[df_full.index >= start_date].copy()
+    df_n_year.dropna(subset=['PE_TTM'], inplace=True) # 排除计算中的NaN
+
+    if df_n_year.empty:
+        return np.nan, np.nan, np.nan
+
+    # 1. 平均值
+    avg_pe = df_n_year['PE_TTM'].mean()
+
+    # 2. 计算偏离度
+    max_dev, min_dev = np.nan, np.nan
+    if pd.notna(avg_pe) and avg_pe > 0:
+        # 偏离度 = (历史PE - 平均PE) / 平均PE
+        deviation_pct = (df_n_year['PE_TTM'] - avg_pe) / avg_pe
+        max_dev = deviation_pct.max() * 100 # 最大偏离度百分比
+        min_dev = deviation_pct.min() * 100 # 最小偏离度百分比
+
+    return avg_pe, max_dev, min_dev
+
+# dashboard.py - 新增 plot_pe_close_combined (V25.1 - 包含 10 年线)
+
+def plot_pe_close_combined(selected_name, df_full, history_state):
+    """
+    V25.1 修复版：绘制PE历史图和指数点位图，并新增 3/5/10 年均线。
+    """
+    # 确保 Plotly 导入: import plotly.graph_objects as go, from plotly.subplots import make_subplots
+    df = df_full.copy()
+    
+    if df.empty or 'PE_TTM' not in df.columns or 'close' not in df.columns:
+        # st.warning("数据不足，无法绘制图表。请检查文件是否包含'PE_TTM'和'close'列。")
+        return # 避免在没有数据时报错
+
+
+    # --- 1. 计算历史平均PE (3年, 5年, 10年) ---
+    # 我们使用 calculate_n_year_avg_pe 的第一个返回值（平均PE）作为参考线
+    avg_3y_pe, _, _ = calculate_n_year_avg_pe(df, 3) 
+    avg_5y_pe, _, _ = calculate_n_year_avg_pe(df, 5) 
+    avg_10y_pe, _, _ = calculate_n_year_avg_pe(df, 10) # <-- 10年线
+
+    # --- 2. 创建图表 ---
+    fig = make_subplots(rows=2, cols=1, 
+                        shared_xaxes=True, 
+                        vertical_spacing=0.05, 
+                        row_heights=[0.7, 0.3],
+                        subplot_titles=[f'{selected_name} - PE 走势', f'{selected_name} - 点位走势']) 
+
+    # --- 3. PE 图 (上半部分) ---
+    fig.add_trace(go.Scatter(x=df.index, y=df['PE_TTM'], mode='lines', name='PE (TTM)', 
+                             line=dict(color='blue')), 
+                  row=1, col=1)
+
+    # 添加 3/5/10 年平均 PE 线
+    if not np.isnan(avg_3y_pe):
+        fig.add_hline(y=avg_3y_pe, line_dash="dash", line_color="green", opacity=0.8,
+                      annotation_text=f"3年均值({avg_3y_pe:.2f})", annotation_position="bottom right", row=1, col=1)
+    
+    if not np.isnan(avg_5y_pe):
+        fig.add_hline(y=avg_5y_pe, line_dash="dash", line_color="orange", opacity=0.8,
+                      annotation_text=f"5年均值({avg_5y_pe:.2f})", annotation_position="top left", row=1, col=1)
+
+    if not np.isnan(avg_10y_pe):
+        fig.add_hline(y=avg_10y_pe, line_dash="dash", line_color="purple", opacity=0.8,
+                      annotation_text=f"10年均值({avg_10y_pe:.2f})", annotation_position="bottom left", row=1, col=1)
+
+    # --- 4. 交易标记 (保持原有逻辑) ---
+    buy_trades = pd.DataFrame([h for h in history_state.get('history', []) if h['type'] == '买入'])
+    sell_trades = pd.DataFrame([h for h in history_state.get('history', []) if h['type'] == '卖出'])
+    
+    if not buy_trades.empty:
+        buy_trades['date'] = pd.to_datetime(buy_trades['date'])
+        fig.add_trace(go.Scatter(x=buy_trades['date'], y=buy_trades['pe'], mode='markers', name='买入', 
+                                 marker={'size': 10, 'symbol': 'triangle-up', 'color': 'green'}), row=1, col=1)
+
+    if not sell_trades.empty:
+        sell_trades['date'] = pd.to_datetime(sell_trades['date'])
+        fig.add_trace(go.Scatter(x=sell_trades['date'], y=sell_trades['pe'], mode='markers', name='卖出', 
+                                 marker={'size': 10, 'symbol': 'triangle-down', 'color': 'red'}), row=1, col=1)
+    
+    # --- 5. 指数点位图 (下半部分) ---
+    fig.add_trace(go.Scatter(x=df.index, y=df['close'], mode='lines', name='指数点位', 
+                             line=dict(color='gray')), row=2, col=1)
+    
+    # --- 6. 布局设置 ---
+    fig.update_layout(title_text=f"<b>{selected_name} - 估值与点位历史走势</b>", 
+                      height=700,
+                      hovermode="x unified",
+                      legend_orientation="h",
+                      template="plotly_white")
+    
+    fig.update_xaxes(showgrid=False, rangeslider_visible=False, row=1, col=1)
+    fig.update_yaxes(title_text="PE (TTM)", row=1, col=1)
+    fig.update_yaxes(title_text="指数点位", row=2, col=1)
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+    
 # ================= 颜色高亮函数 =================
 
 # ... (高亮函数保持不变) ...
@@ -710,136 +916,186 @@ for code, name in TARGETS.items():
         else:
             st.info("无决策日志信息。")
 
-# --- 交易登记逻辑 (新增交易管理) ---
+# --- 交易登记逻辑 (新增交易管理 - V23.4 升级：批量导入支持多指数) ---
 st.markdown("---")
-st.header("🛒 交易登记与管理")
+st.header("🛒 交易登记与管理 (本地文件模式)")
 
-tab_record, tab_manage = st.tabs(["📝 登记新交易", "🗑️ 管理/修改交易记录"])
+# V23.4: 新增 "批量导入" 标签页
+tab_record, tab_manage, tab_import = st.tabs(["📝 登记新交易", "⚙️ 管理/修改记录", "📤 批量导入"])
 
-# ======================= Tab 1: 登记新交易 (V22.0 优化) =======================
+# 准备指数名称到文件名的反向映射，用于导入查找
+TARGETS_REVERSE = {v: k for k, v in TARGETS.items()}
+
+
+# ======================= Tab 1: 登记新交易 (保持不变) =======================
 with tab_record:
-    st.markdown(f"每次默认操作 **1 份**。当前最大持仓限制：**{MAX_UNITS}** 份。")
+    MAX_UNITS = get_strategy_param("MAX_UNITS") # 读取当前 MAX_UNITS (150份)
+    st.markdown(f"每份固定金额：**{FIXED_AMOUNT_PER_PORTION:.0f} 元**。当前最大持仓限制：**{MAX_UNITS}** 份。")
+
     with st.container(border=True):
-        col1, col2, col3, col4, col5 = st.columns([2, 1, 2, 2, 2])
+        col1, col2, col_fund, col3, col4 = st.columns([2, 1.5, 2, 2, 2])
 
         name_options = list(TARGETS.values())
 
         with col1:
             selected_name_r = st.selectbox("选择指数", name_options, key="select_record_index")
-            selected_file_r = [f for f, n in TARGETS.items() if n == selected_name_r][0]
-            current_holdings_r = state[selected_file_r]['holdings']
+            selected_file_r = next(f for f, n in TARGETS.items() if n == selected_name_r)
+            # V23.3: 检查当前持有的份数
+            current_holdings_portions = state[selected_file_r]['portions_held'] 
+            st.markdown(f"**当前持有份数:** `{current_holdings_portions:.1f} 份 (上限: {MAX_UNITS} 份)`")
+
 
         with col2:
             action_r = st.selectbox("操作类型", ["买入", "卖出"], key="select_action")
+            
+        with col_fund:
+            # V23.3 新增字段：基金名称/代码
+            fund_name_r = st.text_input("基金名称/代码 (例: 513050)", value="", key="input_fund_name")
             
         with col3:
             trade_date_r = st.date_input("成交日期", value=datetime.now().date(), max_value=datetime.now().date(), key="input_date")
             trade_date_str_r = trade_date_r.strftime("%Y-%m-%d")
 
         with col4:
-            trade_price_r = st.number_input("ETF 实际成交价格", min_value=0.0001, format="%.4f", value=1.0000, step=0.0001, key="input_price")
-            trade_unit_r = st.number_input("交易份数", min_value=1, value=1, step=1, key="input_unit")
+            trade_price_r = st.number_input("ETF 实际成交价格/净值", min_value=0.0001, format="%.4f", value=1.0000, step=0.0001, key="input_price")
+            # V23.3: 交易份数 (每份300元)
+            trade_portions_r = st.number_input("交易份数 (每份300元)", min_value=1, value=1, step=1, key="input_portion")
 
-        with col5:
-            st.markdown("##### ") 
-            st.markdown("##### ") 
-            if st.button("提交新记录", type="primary", use_container_width=True):
-                s = state[selected_file_r] 
-                df_selected_r = full_data_frames.get(selected_file_r)
-                
-                if df_selected_r is None:
-                    st.error(f"⚠️ 无法提交记录：数据文件 {selected_file_r} 读取失败。请稍后重试。")
-                    time.sleep(1); st.cache_data.clear(); st.rerun()
 
-                # V22.0: 使用改进的 find_pe_by_date
-                trade_pe_r, trade_close_r = find_pe_by_date(df_selected_r, trade_date_str_r)
-                
-                saved_pe_r = round(trade_pe_r, 2) if not np.isnan(trade_pe_r) else None
-                saved_close_r = round(trade_close_r, 2) if not np.isnan(trade_close_r) else None
-                
-                pe_display_str_r = f"{saved_pe_r:.2f}" if saved_pe_r is not None else 'N/A'
-                    
-                transaction_r = {
-                    "date": trade_date_str_r,
-                    "type": action_r,
-                    "pe": saved_pe_r, 
-                    "close": saved_close_r,
-                    "price": trade_price_r, 
-                    "unit": trade_unit_r
-                }
-                
-                if action_r == "买入":
-                    if current_holdings_r + trade_unit_r <= MAX_UNITS:
-                        s["history"].append(transaction_r) 
-                        state = recalculate_holdings_and_cost(state) # 立即重新计算
-                        save_state(state)
-                        st.success(f"已记录：{selected_name_r} 买入{trade_unit_r}份。PE: {pe_display_str_r}, ETF成交价: {trade_price_r:.4f}。当前持仓 {state[selected_file_r]['holdings']:.1f} 份。")
-                    else:
-                        st.info(f"超过最大持仓份数 ({MAX_UNITS})，本次买入 {trade_unit_r} 份后将超限。")
-                    
-                elif action_r == "卖出":
-                    if current_holdings_r >= trade_unit_r:
-                        s["history"].append(transaction_r) 
-                        state = recalculate_holdings_and_cost(state) # 立即重新计算
-                        save_state(state)
-                        st.warning(f"已记录：{selected_name_r} 卖出{trade_unit_r}份。PE: {pe_display_str_r}, ETF成交价: {trade_price_r:.4f}。当前持仓 {state[selected_file_r]['holdings']:.1f} 份。")
-                    else:
-                        st.error(f"持仓不足。当前持仓 {current_holdings_r:.1f} 份，无法卖出 {trade_unit_r} 份。")
-                        
-                time.sleep(1)
-                st.cache_data.clear() 
-                st.rerun()
-# ----------------------------------------------------
-# V22.2: 数据时效性校验 (调整为 30 天阈值)
-# ----------------------------------------------------
-
-def check_data_freshness():
-    """
-    检查所有配置指数的数据文件是否在合理的时效内更新。
-    返回一个字典，包含需要警告的指数名称及其原因。
-    """
-    stale_files = {}
-    
-    # 设定阈值：如果数据落后于当前日期超过 30 个日历日，则发出警告。
-    # 宽松阈值，只在数据源严重中断时提醒 (1个月)
-    freshness_threshold = datetime.now() - timedelta(days=30)
-
-    for fixed_filename_key, name in TARGETS.items():
-        prefix = fixed_filename_key.split('.')[0]
-        actual_file_path, _, _ = find_latest_data_file(prefix)
-        
-        if not actual_file_path or not os.path.exists(actual_file_path):
-            # 如果文件不存在，立即警告 (这仍然是一个严重问题)
-            stale_files[name] = "数据文件不存在。"
-            continue
-        
-        try:
-            # 尝试加载数据以获取内部最新日期
-            metrics_result = get_metrics_from_csv(actual_file_path)
-            if metrics_result:
-                df_full = metrics_result[5]
-                df_full['Date'] = pd.to_datetime(df_full['Date'])
-                
-                latest_data_date = df_full['Date'].max().normalize()
-                
-                if latest_data_date < freshness_threshold.normalize():
-                    # 只有当最新数据日期超过 30 天阈值时才发出警告
-                    stale_files[name] = f"数据已停止在 {latest_data_date.strftime('%Y-%m-%d')}。"
-            else:
-                stale_files[name] = "无法读取数据内容。"
-
-        except Exception as e:
-            # 文件存在，但读取失败，也视为需要检查
-            stale_files[name] = f"读取文件失败: {e}"
+        if st.button("提交新记录", type="primary", use_container_width=True):
             
-    return stale_files
-# ======================= Tab 2: 管理/修改交易记录 (V22.0 优化) =======================
+            # --- 交易前数据准备 ---
+            s = state[selected_file_r] 
+            df_selected_r = full_data_frames.get(selected_file_r)
+            
+            if not fund_name_r.strip():
+                st.error("请输入基金名称/代码，以便区分追踪同一指数的不同基金！")
+                st.stop()
+            
+            if df_selected_r is None:
+                st.error(f"⚠️ 无法提交记录：数据文件 {selected_file_r} 读取失败。")
+                st.stop()
+
+            # 查找 PE/Close
+            trade_pe_r, trade_close_r = find_pe_by_date(df_selected_r, trade_date_str_r)
+            saved_pe_r = round(trade_pe_r, 2) if not np.isnan(trade_pe_r) else None
+            saved_close_r = round(trade_close_r, 2) if not np.isnan(trade_close_r) else None
+            
+            pe_display_str_r = f"{saved_pe_r:.2f}" if saved_pe_r is not None else 'N/A'
+            trade_unit_shares = 0.0 # 本次实际交易的基金份额
+
+
+            # --- 核心买卖逻辑 (V23.3) ---
+            
+            if action_r == "买入":
+                # 1. 计算买入的实际基金份额 (Fund Shares)
+                trade_unit_shares = (trade_portions_r * FIXED_AMOUNT_PER_PORTION) / trade_price_r
+                
+                if current_holdings_portions + trade_portions_r <= MAX_UNITS:
+                    
+                    transaction_r = {
+                        "date": trade_date_str_r, "type": action_r, "pe": saved_pe_r, 
+                        "close": saved_close_r, "price": trade_price_r, 
+                        "unit": trade_unit_shares,   # V23.3: 实际基金份额
+                        "portions": trade_portions_r, # V23.3: 交易的份数 (300元/份)
+                        "fund_name": fund_name_r      # V23.3 新增
+                    }
+                    
+                    s["history"].append(transaction_r) 
+                    state = recalculate_holdings_and_cost(state) 
+                    save_state(state)
+                    st.success(f"已记录：{selected_name_r} 买入{trade_portions_r}份 ({trade_unit_shares:.2f} 份额)。基金：{fund_name_r}。当前持有份数 {state[selected_file_r]['portions_held']:.1f} 份。")
+                else:
+                    st.info(f"超过最大持仓份数 ({MAX_UNITS})，本次买入 {trade_portions_r} 份后将超限。")
+                
+            elif action_r == "卖出":
+                
+                # 1. 查找所有买入记录，计算总买入份额和总买入份数
+                bought_history = [t for t in s['history'] if t.get('type') == '买入' and t.get('portions') is not None and t.get('unit') is not None]
+                total_bought_shares = sum(t.get('unit', 0) for t in bought_history)
+                total_bought_portions = sum(t.get('portions', 0) for t in bought_history)
+                
+                if total_bought_portions > 0 and current_holdings_portions > 1e-6:
+                    # 2. 计算每份买入的平均份额
+                    avg_shares_per_portion = total_bought_shares / total_bought_portions
+                    # 3. 计算本次卖出的实际基金份额 (卖出 N 份 * 平均每份份额)
+                    trade_unit_shares = trade_portions_r * avg_shares_per_portion
+                    
+                    st.warning(f"本次卖出 {trade_portions_r} 份，按平均成本法卖出 {trade_unit_shares:.2f} 基金份额 (平均每份 {avg_shares_per_portion:.2f} 份额)。")
+                else:
+                    st.error("无法计算平均份额，请确保至少有一笔包含 'portions' 和 'unit' 的买入记录。")
+                    st.stop()
+                    
+                if current_holdings_portions >= trade_portions_r:
+                    
+                    transaction_r = {
+                        "date": trade_date_str_r, "type": action_r, "pe": saved_pe_r, 
+                        "close": saved_close_r, "price": trade_price_r, 
+                        "unit": trade_unit_shares,   # V23.3: 实际基金份额 (平均)
+                        "portions": trade_portions_r, # V23.3: 交易的份数
+                        "fund_name": fund_name_r      # V23.3 新增
+                    }
+                    
+                    s["history"].append(transaction_r) 
+                    state = recalculate_holdings_and_cost(state)
+                    save_state(state)
+                    st.warning(f"已记录：{selected_name_r} 卖出{trade_portions_r}份 ({trade_unit_shares:.2f} 份额)。当前持有份数 {state[selected_file_r]['portions_held']:.1f} 份。")
+                else:
+                    st.error(f"持有份数不足。当前持有份数 {current_holdings_portions:.1f} 份，无法卖出 {trade_portions_r} 份。")
+                    
+            time.sleep(1)
+            st.cache_data.clear() 
+            st.rerun()
+
+    
+    st.markdown("---")
+    st.subheader("历史交易记录 (来自本地文件)")
+    
+    # 历史记录显示 (保持不变)
+    if 'select_record_index' in st.session_state and st.session_state.select_record_index:
+        selected_name = st.session_state.select_record_index
+        selected_file = next(f for f, n in TARGETS.items() if n == selected_name)
+        holding_info = state[selected_file]
+        
+        if holding_info['history']:
+            df_history = pd.DataFrame([
+                {**h, 'date': h['date'].strftime('%Y-%m-%d') if hasattr(h['date'], 'strftime') else h['date']}
+                for h in holding_info['history']
+            ])
+            
+            # V23.3: 增加 portions 和 fund_name 显示
+            df_display_history = df_history[['date', 'type', 'portions', 'fund_name', 'price', 'unit', 'pe', 'close']].copy()
+            df_display_history = df_display_history.rename(columns={
+                'date': '成交日期', 'type': '操作类型', 'portions': '交易份数(300元/份)', 'fund_name': '基金代码/名称', 'price': 'ETF成交价', 
+                'unit': '基金份额', 'pe': '成交PE(自动)', 'close': '成交点位(自动)'
+            })
+            
+            df_display_history = df_display_history.iloc[::-1] # 倒序显示，最新记录在前
+
+            st.dataframe(
+                df_display_history.style.format({
+                    'ETF成交价': "¥ {:.4f}", 
+                    '交易份数(300元/份)': "{:.2f}",
+                    '基金份额': "{:.2f}",
+                    '成交PE(自动)': "{:.2f}",
+                    '成交点位(自动)': "{:.2f}"
+                }, na_rep='N/A'),
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info(f"当前 {selected_name} 没有交易记录。")
+    else:
+        st.info("请在上方选择一个指数以查看其历史交易记录。")
+
+
+# ======================= Tab 2: 管理/修改交易记录 (保持不变) =======================
 with tab_manage:
     st.markdown("⚠️ **危险操作！** 删除和修改记录将直接影响持仓和成本计算。")
 
     name_options_m = list(TARGETS.values())
-    selected_name_m = st.selectbox("选择要管理记录的指数", name_options_m, key="select_manage_index")
-    selected_file_m = [f for f, n in TARGETS.items() if n == selected_name_m][0]
+    selected_name_m = st.selectbox("选择要管理记录的指数", name_options_m, key="select_manage_index_m") # 确保 key 唯一
+    selected_file_m = next(f for f, n in TARGETS.items() if n == selected_name_m)
     
     s_m = state[selected_file_m]
     
@@ -847,21 +1103,23 @@ with tab_manage:
         st.info("该指数尚无交易记录可供管理。")
     else:
         # 将历史记录转换为 DataFrame 以便展示索引
-        history_df_m = pd.DataFrame(s_m['history'])
+        history_df_m_list = [{**h, 'date': h['date'].strftime('%Y-%m-%d') if hasattr(h['date'], 'strftime') else h['date']} for h in s_m['history']]
+        history_df_m = pd.DataFrame(history_df_m_list)
         history_df_m['索引'] = history_df_m.index # 添加索引列用于识别记录
         
-        df_display_m = history_df_m[['索引', 'date', 'type', 'price', 'unit', 'pe', 'close']].copy()
-        df_display_m = df_display_m.rename(columns={'date': '成交日期', 'type': '操作类型', 'price': 'ETF成交价', 'unit': '交易份数', 'pe': '成交PE(自动)', 'close': '成交点位(自动)'})
+        # V23.3: 增加 'portions' 和 'fund_name' 列显示
+        df_display_m = history_df_m[['索引', 'date', 'type', 'portions', 'fund_name', 'price', 'unit', 'pe', 'close']].copy()
+        df_display_m = df_display_m.rename(columns={'date': '成交日期', 'type': '操作类型', 'portions': '交易份数(300元/份)', 'fund_name': '基金代码/名称', 'price': 'ETF成交价', 'unit': '基金份额', 'pe': '成交PE(自动)', 'close': '成交点位(自动)'})
         
         # 格式化 PE/Close/Price
-        for col in ['ETF成交价', '成交PE(自动)', '成交点位(自动)']:
+        for col in ['ETF成交价', '成交PE(自动)', '成交点位(自动)', '基金份额', '交易份数(300元/份)']:
              if col in df_display_m.columns:
                  if col == 'ETF成交价':
                      df_display_m[col] = df_display_m[col].apply(lambda x: f"{x:.4f}" if pd.notna(x) and x is not None else 'N/A')
                  else:
                      df_display_m[col] = df_display_m[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) and x is not None else 'N/A')
         
-        st.dataframe(df_display_m, use_container_width=True)
+        st.dataframe(df_display_m, use_container_width=True, hide_index=True)
 
         # --- 删除操作 ---
         st.subheader("删除记录")
@@ -875,72 +1133,248 @@ with tab_manage:
                 if 0 <= index_to_delete < len(s_m['history']):
                     del s_m['history'][index_to_delete]
                     state = recalculate_holdings_and_cost(state) # 立即重新计算
-                    save_state(state)
+                    save_state(state) # 保存到本地 JSON 文件
                     st.success(f"✅ 记录 {index_to_delete} 已删除，持仓已重新计算。")
                     time.sleep(1)
-                    st.cache_data.clear() 
+                    st.cache_data.clear()  
                     st.rerun()
                 else:
                     st.error("索引超出范围，请检查输入。")
 
         st.markdown("---")
         
-        # --- 修改操作 (仅支持修改价格/日期/类型/份数) ---
+        # --- 修改操作 (V23.3: 需同时修改 portions, unit, fund_name) ---
         st.subheader("修改记录")
         
         df_selected_m = full_data_frames.get(selected_file_m)
-        if df_selected_m is None:
-            st.error("无法获取指数数据，无法进行修改。请确保数据文件存在。")
-        else:
-            col_mod_index, col_mod_type, col_mod_date, col_mod_price = st.columns(4)
+
+        col_mod_index, col_mod_type, col_mod_date, col_mod_price = st.columns(4)
+        
+        # 1. 选择要修改的索引
+        with col_mod_index:
+            index_to_modify = st.number_input("输入要修改的记录行索引", min_value=0, max_value=len(history_df_m) - 1, step=1, key="modify_index")
+        
+        if 0 <= index_to_modify < len(s_m['history']):
+            record_to_modify = s_m['history'][index_to_modify]
             
-            # 1. 选择要修改的索引
-            with col_mod_index:
-                index_to_modify = st.number_input("输入要修改的记录行索引", min_value=0, max_value=len(history_df_m) - 1, step=1, key="modify_index")
+            # 2. 修改操作类型
+            with col_mod_type:
+                new_type = st.selectbox("新操作类型", ["买入", "卖出"], index=0 if record_to_modify.get('type') == '买入' else 1, key="modify_type")
+
+            # 3. 修改成交日期
+            with col_mod_date:
+                try:
+                    current_date = datetime.strptime(record_to_modify.get('date'), "%Y-%m-%d").date()
+                except:
+                    current_date = datetime.now().date()
+                new_date = st.date_input("新成交日期", value=current_date, max_value=datetime.now().date(), key="modify_date")
+                new_date_str = new_date.strftime("%Y-%m-%d")
+
+            # 4. 修改 ETF 价格和份数/份额
+            with col_mod_price:
+                new_price = st.number_input("新ETF成交价", min_value=0.0001, format="%.4f", value=record_to_modify.get('price', 1.0000), step=0.0001, key="modify_price")
             
-            if 0 <= index_to_modify < len(s_m['history']):
-                record_to_modify = s_m['history'][index_to_modify]
+            # V23.3: 允许用户直接修改 'portions' (份数)
+            new_portions = st.number_input("新交易份数 (300元/份)", min_value=1, value=int(record_to_modify.get('portions', 1)), step=1, key="modify_portions")
+            
+            # V23.3: 允许用户直接修改 'unit' (基金份额)
+            new_unit = st.number_input("新基金份额 (仅用于卖出平均份额失败时手动调整)", min_value=0.0, value=record_to_modify.get('unit', 1.0), step=0.01, key="modify_unit")
+            
+            # V23.3: 允许修改基金代码/名称
+            new_fund_name = st.text_input("新基金代码/名称", value=record_to_modify.get('fund_name', ''), key="modify_fund_name")
+
+            if st.button(f"🟡 确认修改第 {index_to_modify} 行记录", key="confirm_modify_button"):
                 
-                # 2. 修改操作类型
-                with col_mod_type:
-                    new_type = st.selectbox("新操作类型", ["买入", "卖出"], index=0 if record_to_modify.get('type') == '买入' else 1, key="modify_type")
+                # 重新查找新的 PE/Close
+                trade_pe_mod, trade_close_mod = find_pe_by_date(df_selected_m, new_date_str)
+                saved_pe_mod = round(trade_pe_mod, 2) if not np.isnan(trade_pe_mod) else None
+                saved_close_mod = round(trade_close_mod, 2) if not np.isnan(trade_close_mod) else None
 
-                # 3. 修改成交日期
-                with col_mod_date:
-                    try:
-                        current_date = datetime.strptime(record_to_modify.get('date'), "%Y-%m-%d").date()
-                    except:
-                         current_date = datetime.now().date()
-                    new_date = st.date_input("新成交日期", value=current_date, max_value=datetime.now().date(), key="modify_date")
-                    new_date_str = new_date.strftime("%Y-%m-%d")
+                # V23.3: 核心修改逻辑
+                if new_type == '买入':
+                     # 重新计算基金份额: 份数 * 金额 / 价格
+                     final_unit = (new_portions * FIXED_AMOUNT_PER_PORTION) / new_price
+                elif new_type == '卖出':
+                     final_unit = new_unit 
+                     st.warning("⚠️ 卖出记录修改时，基金份额(unit)不会自动重新计算平均份额。请确认您输入的 '新基金份额' 是正确的。")
+                else:
+                     final_unit = new_unit
+                     
+                # 更新记录
+                s_m['history'][index_to_modify] = {
+                    "date": new_date_str,
+                    "type": new_type,
+                    "pe": saved_pe_mod, 
+                    "close": saved_close_mod,
+                    "price": new_price, 
+                    "unit": final_unit, # 最终基金份额
+                    "portions": new_portions, # 最终份数
+                    "fund_name": new_fund_name # 基金名称
+                }
 
-                # 4. 修改 ETF 价格和份数
-                with col_mod_price:
-                    new_price = st.number_input("新ETF成交价", min_value=0.0001, format="%.4f", value=record_to_modify.get('price', 1.0000), step=0.0001, key="modify_price")
-                new_unit = st.number_input("新交易份数", min_value=1, value=record_to_modify.get('unit', 1), step=1, key="modify_unit")
-
-                if st.button(f"🟡 确认修改第 {index_to_modify} 行记录", key="confirm_modify_button"):
-                    
-                    # V22.0: 重新查找新的 PE/Close (使用改进的 find_pe_by_date)
-                    trade_pe_mod, trade_close_mod = find_pe_by_date(df_selected_m, new_date_str)
-                    saved_pe_mod = round(trade_pe_mod, 2) if not np.isnan(trade_pe_mod) else None
-                    saved_close_mod = round(trade_close_mod, 2) if not np.isnan(trade_close_mod) else None
-
-                    # 更新记录
-                    s_m['history'][index_to_modify] = {
-                        "date": new_date_str,
-                        "type": new_type,
-                        "pe": saved_pe_mod, 
-                        "close": saved_close_mod,
-                        "price": new_price, 
-                        "unit": new_unit
-                    }
-
-                    state = recalculate_holdings_and_cost(state) # 立即重新计算
-                    save_state(state)
-                    st.success(f"✅ 记录 {index_to_modify} 已更新并重新计算持仓。")
-                    time.sleep(1)
-                    st.cache_data.clear() 
-                    st.rerun()
-            else:
+                state = recalculate_holdings_and_cost(state)
+                save_state(state)
+                st.success(f"✅ 记录 {index_to_modify} 已更新并重新计算持仓。")
+                time.sleep(1)
+                st.cache_data.clear() 
+                st.rerun()
+        else:
+            if len(s_m['history']) > 0:
                 st.error("索引超出范围，请检查输入。")
+                
+# ======================= Tab 3: 批量导入 (V23.4.1 修复 openpyxl 依赖问题) =======================
+with tab_import:
+    
+    st.header("📤 批量导入交易记录")
+    st.markdown("---")
+    st.info("请确保您的导入文件包含以下表头（名称必须精确）：**`日期`**, **`操作类型`**, **`净值`**, **`基金代码`**, **`所属指数`**。")
+    st.markdown(f"**导入假设:** 每行记录默认对应 **1 份** 操作 (固定金额 **{FIXED_AMOUNT_PER_PORTION:.0f} 元**)。")
+    
+    uploaded_file = st.file_uploader("选择交易记录文件 (.csv 或 .xlsx)", type=["csv", "xlsx"])
+    
+    if uploaded_file is not None:
+        df_import = None
+        file_ext = uploaded_file.name.split('.')[-1].lower()
+        
+        try:
+            # --- 文件读取逻辑 (V23.4.1 改进错误处理) ---
+            if file_ext == 'csv':
+                df_import = pd.read_csv(uploaded_file)
+            elif file_ext == 'xlsx':
+                try:
+                    df_import = pd.read_excel(uploaded_file)
+                except ImportError as ie:
+                    # 捕获 openpyxl 缺失的错误
+                    if 'openpyxl' in str(ie):
+                        st.error("无法读取 .xlsx 文件。缺少依赖 'openpyxl'。")
+                        st.warning("您需要在您的环境中安装 openpyxl 库 (`pip install openpyxl`)，**或者**请将您的文件保存为 **.csv** 格式后重新上传。")
+                        st.stop()
+                    else:
+                        raise # Re-raise if it's another import error
+                except Exception as e:
+                     st.error(f"读取 .xlsx 文件时发生错误: {e}")
+                     st.stop()
+            else:
+                 st.error("不支持的文件格式。请上传 .csv 或 .xlsx 文件。")
+                 st.stop()
+            
+            # Check if df_import was successfully created and is not empty
+            if df_import is None or df_import.empty:
+                 st.error("文件内容为空或无法解析。")
+                 st.stop()
+
+            # --- 列验证与清理 ---
+            required_cols = ['日期', '操作类型', '净值', '基金代码', '所属指数']
+            if not all(col in df_import.columns for col in required_cols):
+                st.error(f"导入失败：文件缺失必需的列。请确保包含 {required_cols}")
+                st.dataframe(df_import.head())
+                st.stop()
+                
+            df_import = df_import[required_cols].dropna(subset=required_cols)
+            # 重命名以便处理
+            df_import.columns = ['date_str', 'type', 'price', 'fund_name', 'index_name'] 
+            
+            st.subheader("待导入记录预览")
+            st.dataframe(df_import)
+            
+            # 2. 确认按钮
+            if st.button(f"确认导入 {len(df_import)} 条记录", type="primary", use_container_width=True):
+                
+                # 暂存所有新交易，按指数分组
+                new_transactions_by_index = {index_key: [] for index_key in TARGETS.keys()}
+                total_transactions_processed = 0
+                
+                # --- 交易处理：第一遍，收集并计算份额 ---
+                for index, row in df_import.iterrows():
+                    
+                    try:
+                        date_obj = pd.to_datetime(row['date_str']).date()
+                        date_str = date_obj.strftime("%Y-%m-%d")
+                        trade_type = row['type'].strip()
+                        trade_price = float(row['price'])
+                        fund_name = str(row['fund_name']).strip()
+                        index_name = str(row['index_name']).strip() # V23.4: 读取指数名称
+                        trade_portions = 1 # 假设每行对应 1 份
+                        
+                        # V23.4: 核心映射
+                        index_key = TARGETS_REVERSE.get(index_name)
+                        
+                        if not index_key:
+                            st.warning(f"跳过第 {index+1} 行：指数名称 '{index_name}' 在配置中不存在。")
+                            continue
+                        
+                        if trade_type not in ['买入', '卖出']:
+                            st.warning(f"跳过第 {index+1} 行：操作类型 '{trade_type}' 无效。")
+                            continue
+                        
+                        df_full = full_data_frames.get(index_key)
+                        if df_full is None:
+                            st.warning(f"跳过第 {index+1} 行：指数数据文件 {index_key} 未加载，无法回填 PE。")
+                            continue
+                        
+                        # 查找 PE/Close
+                        trade_pe, trade_close = find_pe_by_date(df_full, date_str)
+                        saved_pe = round(trade_pe, 2) if not np.isnan(trade_pe) else None
+                        saved_close = round(trade_close, 2) if not np.isnan(trade_close) else None
+                        
+                        trade_unit_shares = 0.0
+                        
+                        if trade_type == '买入':
+                            # 买入: 份额 = (份数 * 固定金额) / 价格
+                            trade_unit_shares = (trade_portions * FIXED_AMOUNT_PER_PORTION) / trade_price
+                        
+                        elif trade_type == '卖出':
+                            # 卖出：此处不能计算平均份额，因为当前的导入队列可能包含该指数的买入，但尚未写入 state。
+                            # 为了简化和安全，我们暂时将卖出份额设为 0，留待导入后手动检查/修改。
+                            # ⚠️ 警告：卖出操作的份额精确性依赖于导入顺序和平均成本计算。
+                            trade_unit_shares = 0.0 
+                            st.warning(f"注意: {index_name} 第 {index+1} 行的卖出份额在导入时无法准确计算平均成本，已设为 0.0，请在管理页手动修正。")
+
+                        
+                        new_transactions_by_index[index_key].append({
+                            "date": date_str, 
+                            "type": trade_type, 
+                            "pe": saved_pe, 
+                            "close": saved_close, 
+                            "price": trade_price, 
+                            "unit": trade_unit_shares,   # 计算或估算的份额
+                            "portions": trade_portions, # 份数 (固定为 1)
+                            "fund_name": fund_name      # 基金代码/名称
+                        })
+                        total_transactions_processed += 1
+                        
+                    except Exception as e:
+                        st.error(f"处理第 {index+1} 行 ({row['date_str']}) 时发生错误: {e}")
+                        continue
+                
+                # --- 最终保存：按指数遍历并保存 ---
+                
+                saved_count = 0
+                
+                for index_key, new_tx_list in new_transactions_by_index.items():
+                    if new_tx_list:
+                        s = state[index_key]
+                        
+                        # 1. 附加新交易
+                        s['history'].extend(new_tx_list)
+                        
+                        # 2. 重新计算所有持仓（关键步骤）
+                        state = recalculate_holdings_and_cost(state)
+                        saved_count += len(new_tx_list)
+
+                if save_state(state):
+                    st.success(f"✅ 成功导入 {saved_count} 条记录！数据已重新计算并保存到本地文件。")
+                else:
+                    st.error("❌ 导入成功，但保存到本地文件失败。")
+                        
+                time.sleep(1)
+                st.cache_data.clear() 
+                st.rerun()
+                
+            else:
+                st.info("没有有效的记录被导入。")
+                    
+        except Exception as e:
+            # 捕获除 openpyxl ImportError 之外的其他错误
+            st.error(f"文件读取或处理失败。请检查文件格式是否正确。错误: {e}")
+            st.warning("提示：请确保您的文件格式正确（如日期格式），且 Excel 文件中只有**一个工作表**，表头在**第一行**。")
