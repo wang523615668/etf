@@ -45,7 +45,36 @@ DEFAULT_STRATEGY_PARAMS = {
     "VOLATILITY_OVERRIDE_PCT": 0.12, # 波动率限制覆盖比例 (12%)
 }
 
-# ================= 状态与策略函数 (V22.0 优化) =================
+# ====================================================================
+# V23.1: Google Sheets 配置 & 连接 (新增区块)
+# ====================================================================
+
+# Streamlit 连接对象
+SHEETS_CONN = None 
+
+# Sheets 配置（在 Streamlit Cloud 上运行时从 st.secrets['gdrive'] 获取）
+SHEETS_URL = st.secrets['gdrive']['sheet_url'] if 'gdrive' in st.secrets else "LOCAL_TEST_URL" 
+TRADE_SHEET_NAME = "Sheet1" # 您的交易记录工作表名称，如果不是 Sheet1 请修改
+
+def get_sheets_connection():
+    """V23.1: 获取 Streamlit Google Sheets/Drive 连接对象。只有当 Secrets 存在时才尝试连接。"""
+    global SHEETS_CONN
+    
+    # 只有当连接对象为空 并且 Secrets 中存在 'gdrive' 配置时，才尝试建立连接
+    if SHEETS_CONN is None and 'gdrive' in st.secrets:
+        try:
+            SHEETS_CONN = st.connection("gdrive", type="json")
+        except Exception as e:
+            # 云端 Secrets 配置错误时，捕获异常
+            print(f"警告：Sheets Secrets 配置存在错误。错误: {e}")
+            st.error("⚠️ Sheets Secrets 配置错误，请检查 Streamlit Cloud Settings -> Secrets。")
+            pass 
+            
+    return SHEETS_CONN
+
+# ====================================================================
+
+# ================= 状态与策略函数 (V23.1 优化 - Sheets I/O) =================
 
 def initialize_session_state():
     """初始化 Streamlit Session State，包括策略参数。"""
@@ -57,43 +86,149 @@ def get_strategy_param(key):
     initialize_session_state()
     return st.session_state['strategy_params'].get(key, DEFAULT_STRATEGY_PARAMS.get(key))
 
-# V22.0: 优化 load_state/save_state 流程，包含精确的成本和持仓。
-def load_state():
-    """加载本地持仓状态，并确保结构完整。"""
+# ----------------------------------------------------
+# V23.1: Google Sheets 数据加载/存储 (核心 I/O)
+# ----------------------------------------------------
+
+@st.cache_data(ttl=600) # 缓存 10 分钟
+def load_state_from_sheets():
+    """V23.1: 从 Google Sheets 加载所有交易数据并构建状态字典。"""
+    conn = get_sheets_connection()
+    state = {code: {"holdings": 0, "total_cost": 0.0, "history": []} for code in TARGETS.keys()} # 初始状态
+
+    if conn:
+        try:
+            # 读取整个交易记录表格
+            df_transactions = conn.read(spreadsheet=SHEETS_URL, worksheet=TRADE_SHEET_NAME, ttl="10m")
+            
+            if df_transactions.empty or 'index_name' not in df_transactions.columns:
+                return state
+
+            # 确保日期格式化和构建 state
+            df_transactions['date'] = pd.to_datetime(df_transactions['date']).dt.normalize()
+            
+            for _, row in df_transactions.iterrows():
+                # 查找交易名称对应的文件名键
+                fixed_filename_key = next((k for k, v in TARGETS.items() if v == row['index_name']), None)
+                
+                if fixed_filename_key and fixed_filename_key in state:
+                    transaction = {
+                        "date": row['date'],
+                        "type": row['type'], # BUY/SELL
+                        "price": float(row['price']),
+                        "unit": float(row['units']),
+                        "cost": float(row.get('cost', 0)), 
+                        "pe": float(row.get('pe_value', 0)) if pd.notna(row.get('pe_value')) else None,
+                        "close": float(row.get('index_close', 0)) if pd.notna(row.get('index_close')) else None
+                    }
+                    state[fixed_filename_key]['history'].append(transaction)
+            
+            # V23.1: 使用现有的 recalculate_holdings_and_cost
+            state = recalculate_holdings_and_cost(state)
+            return state
+
+        except Exception as e:
+            st.error(f"⚠️ 从 Google Sheets 加载交易数据失败。请检查 Secrets 和表格权限。\n错误: {e}")
+            # Sheets 失败时，尝试加载本地备份
+            return load_state_from_json_backup() 
+    
+    # 如果 Sheets 连接失败（例如本地运行），使用本地 JSON 备份
+    return load_state_from_json_backup() 
+
+
+def load_state_from_json_backup():
+    """V23.1: 仅用于本地测试或云端 Sheets 失败时的应急方案 (基于 V22.0 load_state 简化)。"""
+    STATE_FILE = "portfolio_status.json"
     initial_state = {code: {"holdings": 0, "total_cost": 0.0, "history": []} for code in TARGETS.keys()}
     
     if os.path.exists(STATE_FILE):
         try:
-            state = json.load(open(STATE_FILE, 'r', encoding='utf-8'))
-            # 确保所有指数都有完整的结构
-            for code in TARGETS.keys():
-                 if code not in state:
-                    state[code] = initial_state[code]
-                 else:
-                    # V22.0: 确保 total_cost 字段存在
-                    if "total_cost" not in state[code]:
-                        state[code]["total_cost"] = 0.0 
-                    if "holdings" not in state[code]:
-                        state[code]["holdings"] = 0
-                    if "history" not in state[code]:
-                        state[code]["history"] = []
-            return state
-        except json.JSONDecodeError:
-            print("警告: 状态文件损坏，已重置。")
-            return initial_state
-            
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                 state = json.load(f)
+                 # V23.1: 确保日期是 datetime 对象，以便后续处理
+                 for k in state:
+                    if 'history' in state[k]:
+                        # 兼容 V22.0 的日期格式
+                        state[k]['history'] = [{**h, 'date': pd.to_datetime(h['date'])} for h in state[k]['history']]
+                 
+                 # V23.1: 重新计算持仓和成本
+                 state = recalculate_holdings_and_cost(state) 
+                 return state 
+        except:
+             return initial_state
     return initial_state
 
-def save_state(state):
-    """保存本地持仓状态 (在保存前已调用 recalculate_holdings_and_cost)"""
-    # V22.0: 在这里不调用 recalculate_holdings_and_cost，避免在循环中重复计算
-    with open(STATE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(state, f, ensure_ascii=False, indent=4)
+
+def save_transaction_to_sheets(fixed_filename_key, transaction_type, date, price, unit, current_close, current_pe):
+    """V23.1: 将单笔新交易记录附加到 Google Sheets 的末尾。"""
+    conn = get_sheets_connection()
+    if conn:
+        try:
+            index_name = TARGETS.get(fixed_filename_key, fixed_filename_key)
+            symbol = fixed_filename_key.split('.')[0]
+            
+            new_row = {
+                "ID": datetime.now().strftime('%Y%m%d%H%M%S') + str(np.random.randint(100, 999)),
+                "date": date.strftime("%Y-%m-%d"),
+                "index_name": index_name,
+                "symbol": symbol,
+                "type": transaction_type.upper(), # BUY/SELL
+                "units": unit,
+                "price": price,
+                "cost": unit * price,
+                "index_close": current_close, 
+                "pe_value": current_pe
+            }
+            
+            df_new_row = pd.DataFrame([new_row])
+            conn.insert(
+                spreadsheet=SHEETS_URL, 
+                worksheet=TRADE_SHEET_NAME, 
+                data=df_new_row
+            )
+            return True
+            
+        except Exception as e:
+            st.error(f"写入 Google Sheets 失败。请检查您的 Secrets 配置和表格权限。\n错误详情: {e}")
+            return False
+    
+    st.error("无法连接到 Google Sheets，交易记录未能保存！")
+    return False 
+
+
+# V23.1: 包装 Sheets/JSON 加载器
+def load_state():
+    """V23.1: 指向 Sheets 加载器"""
+    return load_state_from_sheets()
+
+# V23.1: 核心交易函数，负责数据获取、写入 Sheets 和触发刷新
+def add_transaction(state, fixed_filename_key, transaction_type, date, price, unit, current_close):
+    """
+    V23.1: 新增交易，将数据写入 Google Sheets，并触发 Streamlit 刷新。
+    """
+    
+    # 查找当前 PE
+    # 需要获取完整的指标数据来确保 PE/Close 的准确性
+    # 临时调用 get_full_index_metrics，full_data_frames={} 强制它在需要时加载数据
+    df_full_metrics = get_full_index_metrics(fixed_filename_key, state, full_data_frames={}) 
+    current_pe = df_full_metrics.get('current_pe')
+
+    # 调用 Sheets 写入
+    success = save_transaction_to_sheets(fixed_filename_key, transaction_type, date, price, unit, current_close, current_pe)
+    
+    if success:
+        st.cache_data.clear() # 清除缓存，强制重新从 Sheets 读取
+        st.rerun() 
+    
+    return state
+
+
+# 以下保持 V22.0 原有成本计算逻辑不变
 
 def calculate_index_cost(history):
     """
-    V22.0: 根据历史记录，使用先进先出(FIFO)或平均成本法(Average Cost)
-    精确计算当前持仓份数和总成本。这里使用简化且易于理解的**平均成本法**。
+    V22.0: 根据历史记录，使用平均成本法(Average Cost)
+    精确计算当前持仓份数和总成本。
     
     返回: total_units, total_cost
     """
@@ -102,13 +237,14 @@ def calculate_index_cost(history):
     
     for transaction in history:
         unit = transaction.get('unit', 1)
-        price = transaction.get('price', 0)
+        # V23.1/Sheets 中 transaction.get('cost') 是准确的成本值 (unit * price)
+        cost_value = transaction.get('cost', transaction.get('price', 0) * unit) 
         
-        if transaction.get('type') == '买入':
-            total_cost += price * unit
+        if transaction.get('type').upper() == '买入' or transaction.get('type').upper() == 'BUY':
+            total_cost += cost_value
             total_units += unit
-        elif transaction.get('type') == '卖出':
-            if total_units > 0:
+        elif transaction.get('type').upper() == '卖出' or transaction.get('type').upper() == 'SELL':
+            if total_units > 1e-6: # 检查是否有持仓
                 # 卖出时，成本按平均成本法扣除
                 avg_cost_per_unit = total_cost / total_units
                 total_cost -= avg_cost_per_unit * unit
@@ -121,14 +257,21 @@ def calculate_index_cost(history):
             
     return max(0.0, total_units), max(0.0, total_cost)
 
+
 def recalculate_holdings_and_cost(state):
     """V22.0: 遍历所有指数，重新计算并更新状态中的持仓和总成本。"""
     for code, data in state.items():
         if 'history' in data:
+            # 确保 history 里的 date 是 str，以兼容旧的 find_pe_by_date，
+            # 或者确保 find_pe_by_date 内部能处理 datetime
+            
+            # V23.1: load_state_from_sheets 已经确保 date 是 datetime，可以直接使用
             total_units, total_cost = calculate_index_cost(data['history'])
             state[code]['holdings'] = total_units
             state[code]['total_cost'] = total_cost
     return state
+
+
 
 # ================= 核心数据处理函数 (V22.0 优化) =================
 
@@ -834,114 +977,114 @@ with tab_record:
                 st.cache_data.clear() 
                 st.rerun()
 
-# ======================= Tab 2: 管理/修改交易记录 (V22.0 优化) =======================
-with tab_manage:
-    st.markdown("⚠️ **危险操作！** 删除和修改记录将直接影响持仓和成本计算。")
+# --- 交易登记逻辑 (新增交易管理 - V23.1 切换为 Sheets) ---
+st.markdown("---")
+st.header("🛒 交易登记与管理 (Google Sheets 模式)")
 
-    name_options_m = list(TARGETS.values())
-    selected_name_m = st.selectbox("选择要管理记录的指数", name_options_m, key="select_manage_index")
-    selected_file_m = [f for f, n in TARGETS.items() if n == selected_name_m][0]
+# V23.1: 仅保留登记 Tab，因为修改/删除功能应直接在 Google Sheets 中操作
+tab_record = st.tabs(["📝 登记新交易"])[0] 
+
+# 从 state 中获取当前选定指数的持仓信息
+
+with tab_record:
     
-    s_m = state[selected_file_m]
-    
-    if not s_m['history']:
-        st.info("该指数尚无交易记录可供管理。")
-    else:
-        # 将历史记录转换为 DataFrame 以便展示索引
-        history_df_m = pd.DataFrame(s_m['history'])
-        history_df_m['索引'] = history_df_m.index # 添加索引列用于识别记录
+    # --- 登记交易表单 ---
+    with st.form("new_trade_form"):
+        col_select, col_type, col_date = st.columns(3)
         
-        df_display_m = history_df_m[['索引', 'date', 'type', 'price', 'unit', 'pe', 'close']].copy()
-        df_display_m = df_display_m.rename(columns={'date': '成交日期', 'type': '操作类型', 'price': 'ETF成交价', 'unit': '交易份数', 'pe': '成交PE(自动)', 'close': '成交点位(自动)'})
+        name_options = list(TARGETS.values())
         
-        # 格式化 PE/Close/Price
-        for col in ['ETF成交价', '成交PE(自动)', '成交点位(自动)']:
-             if col in df_display_m.columns:
-                 if col == 'ETF成交价':
-                     df_display_m[col] = df_display_m[col].apply(lambda x: f"{x:.4f}" if pd.notna(x) and x is not None else 'N/A')
-                 else:
-                     df_display_m[col] = df_display_m[col].apply(lambda x: f"{x:.2f}" if pd.notna(x) and x is not None else 'N/A')
-        
-        st.dataframe(df_display_m, use_container_width=True)
+        with col_select:
+            # V23.1: 简化选择逻辑
+            trade_index_name = st.selectbox("选择交易指数", name_options, key='trade_index_select')
+            # 查找交易指数的文件名键
+            trade_key = next(k for k, v in TARGETS.items() if v == trade_index_name)
+            current_holdings = state[trade_key]['holdings']
+            # 显示当前持仓，使用户可以判断是否超限
+            st.markdown(f"**当前持仓:** `{current_holdings:.1f} 份 (上限: {MAX_UNITS} 份)`")
 
-        # --- 删除操作 ---
-        st.subheader("删除记录")
-        col_del, col_button_del = st.columns([1, 1])
-        with col_del:
-            index_to_delete = st.number_input("输入要删除的记录行索引 (最左侧列)", min_value=0, max_value=len(history_df_m) - 1, step=1, key="delete_index")
+        with col_type:
+            trade_type = st.radio("操作类型", ["买入", "卖出"], horizontal=True)
+            
+        with col_date:
+            trade_date = st.date_input("交易日期", datetime.now().date(), max_value=datetime.now().date())
         
-        with col_button_del:
-            st.markdown("##### ")
-            if st.button(f"🔴 确认删除第 {index_to_delete} 行记录", key="confirm_delete_button"):
-                if 0 <= index_to_delete < len(s_m['history']):
-                    del s_m['history'][index_to_delete]
-                    state = recalculate_holdings_and_cost(state) # 立即重新计算
-                    save_state(state)
-                    st.success(f"✅ 记录 {index_to_delete} 已删除，持仓已重新计算。")
-                    time.sleep(1)
-                    st.cache_data.clear() 
-                    st.rerun()
-                else:
-                    st.error("索引超出范围，请检查输入。")
+        col_p, col_u = st.columns(2)
+        with col_p:
+            trade_price = st.number_input("交易价格 (ETF净值/单位)", min_value=0.01, format="%.4f")
+        with col_u:
+            # 允许输入非整数份数
+            trade_unit = st.number_input("交易份数 (1000元/份)", min_value=0.01, format="%.2f")
 
-        st.markdown("---")
-        
-        # --- 修改操作 (仅支持修改价格/日期/类型/份数) ---
-        st.subheader("修改记录")
-        
-        df_selected_m = full_data_frames.get(selected_file_m)
-        if df_selected_m is None:
-            st.error("无法获取指数数据，无法进行修改。请确保数据文件存在。")
-        else:
-            col_mod_index, col_mod_type, col_mod_date, col_mod_price = st.columns(4)
+        submitted = st.form_submit_button("记录交易并更新 (写入 Sheets)")
+
+        if submitted:
             
-            # 1. 选择要修改的索引
-            with col_mod_index:
-                index_to_modify = st.number_input("输入要修改的记录行索引", min_value=0, max_value=len(history_df_m) - 1, step=1, key="modify_index")
+            # --- 交易前的逻辑检查 ---
+            if trade_type == "买入" and current_holdings + trade_unit > MAX_UNITS:
+                st.error(f"⚠️ 超过最大持仓份数限制 ({MAX_UNITS} 份)。请调整份数。")
+                st.stop()
             
-            if 0 <= index_to_modify < len(s_m['history']):
-                record_to_modify = s_m['history'][index_to_modify]
+            if trade_type == "卖出" and trade_unit > current_holdings:
+                st.error(f"⚠️ 现有持仓不足 ({current_holdings:.1f} 份)。无法卖出 {trade_unit} 份。")
+                st.stop()
                 
-                # 2. 修改操作类型
-                with col_mod_type:
-                    new_type = st.selectbox("新操作类型", ["买入", "卖出"], index=0 if record_to_modify.get('type') == '买入' else 1, key="modify_type")
+            # --- 实际交易逻辑 (Sheets 写入) ---
+            
+            # 1. 查找最新的收盘价，作为写入 Sheets 的估值基准
+            trade_data_metrics = get_full_index_metrics(trade_key, state, full_data_frames={})
+            latest_close = trade_data_metrics.get('current_close', trade_price) # 兜底使用交易价格
 
-                # 3. 修改成交日期
-                with col_mod_date:
-                    try:
-                        current_date = datetime.strptime(record_to_modify.get('date'), "%Y-%m-%d").date()
-                    except:
-                         current_date = datetime.now().date()
-                    new_date = st.date_input("新成交日期", value=current_date, max_value=datetime.now().date(), key="modify_date")
-                    new_date_str = new_date.strftime("%Y-%m-%d")
+            st.info(f"正在将 {trade_index_name} 的 {trade_type} 交易记录写入 Google Sheets...")
+            
+            # V23.1: 调用 Sheets 写入函数
+            state = add_transaction(
+                state, 
+                trade_key, 
+                trade_type, 
+                datetime.combine(trade_date, datetime.min.time()), # 转换为 datetime 对象
+                trade_price, 
+                trade_unit, 
+                latest_close
+            )
+            
+st.markdown("---")
+st.subheader("历史交易记录 (来自 Google Sheets)")
 
-                # 4. 修改 ETF 价格和份数
-                with col_mod_price:
-                    new_price = st.number_input("新ETF成交价", min_value=0.0001, format="%.4f", value=record_to_modify.get('price', 1.0000), step=0.0001, key="modify_price")
-                new_unit = st.number_input("新交易份数", min_value=1, value=record_to_modify.get('unit', 1), step=1, key="modify_unit")
-
-                if st.button(f"🟡 确认修改第 {index_to_modify} 行记录", key="confirm_modify_button"):
-                    
-                    # V22.0: 重新查找新的 PE/Close (使用改进的 find_pe_by_date)
-                    trade_pe_mod, trade_close_mod = find_pe_by_date(df_selected_m, new_date_str)
-                    saved_pe_mod = round(trade_pe_mod, 2) if not np.isnan(trade_pe_mod) else None
-                    saved_close_mod = round(trade_close_mod, 2) if not np.isnan(trade_close_mod) else None
-
-                    # 更新记录
-                    s_m['history'][index_to_modify] = {
-                        "date": new_date_str,
-                        "type": new_type,
-                        "pe": saved_pe_mod, 
-                        "close": saved_close_mod,
-                        "price": new_price, 
-                        "unit": new_unit
-                    }
-
-                    state = recalculate_holdings_and_cost(state) # 立即重新计算
-                    save_state(state)
-                    st.success(f"✅ 记录 {index_to_modify} 已更新并重新计算持仓。")
-                    time.sleep(1)
-                    st.cache_data.clear() 
-                    st.rerun()
-            else:
-                st.error("索引超出范围，请检查输入。")
+# 确保选择了一个指数来显示历史记录
+if 'trade_index_select' in st.session_state and st.session_state.trade_index_select:
+    selected_name = st.session_state.trade_index_select
+    selected_file = next(f for f, n in TARGETS.items() if n == selected_name)
+    holding_info = state[selected_file]
+    
+    # 显示历史交易记录 (从 Sheets 加载)
+    if holding_info['history']:
+        # 确保 history 中的 date 是 str，以便于 DataFrame 转换
+        df_history = pd.DataFrame([
+            # 确保日期是字符串格式，PE/Close是数字
+            {**h, 'date': h['date'].strftime('%Y-%m-%d'), 
+             'pe': h.get('pe', np.nan), 'close': h.get('close', np.nan)}
+            for h in holding_info['history']
+        ])
+        
+        # 仅显示用户关注的字段
+        df_display_history = df_history[['date', 'type', 'price', 'unit', 'pe', 'close']].copy()
+        df_display_history = df_display_history.rename(columns={
+            'date': '成交日期', 'type': '操作类型', 'price': 'ETF成交价', 
+            'unit': '交易份数', 'pe': '成交PE(自动)', 'close': '成交点位(自动)'
+        })
+        
+        st.dataframe(
+            df_display_history.style.format({
+                'ETF成交价': "¥ {:.4f}", 
+                '交易份数': "{:.2f}",
+                '成交PE(自动)': "{:.2f}",
+                '成交点位(自动)': "{:.2f}"
+            }),
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info(f"当前 {selected_name} 没有交易记录。")
+else:
+    st.info("请在上方选择一个指数以查看其历史交易记录。")
