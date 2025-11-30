@@ -1,4 +1,4 @@
-# pages/1_📊_Trade_Analysis.py (V20.0 - 图表与详情合并)
+# pages/1_📊_Trade_Analysis.py (V23.4 - 图表与详情合并)
 
 import streamlit as st
 import pandas as pd
@@ -6,11 +6,22 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
+import os
+import sys
+
+# ----------------------------------------------------
+# 增强修复：确保 Streamlit 页面能找到父目录的模块
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.abspath(os.path.join(current_dir, '..'))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+# ----------------------------------------------------
+
 
 # 从主文件导入配置和核心函数
 try:
     # 导入所需的函数和配置
-    from dashboard import TARGETS, load_state, get_metrics_from_csv, find_latest_data_file, get_full_index_metrics
+    from dashboard import TARGETS, load_state, get_metrics_from_csv, find_latest_data_file, get_full_index_metrics, calculate_index_pl_metrics
 except ImportError:
     st.error("导入主文件配置失败。请确保 dashboard.py 位于项目根目录。")
     st.stop()
@@ -81,7 +92,7 @@ def plot_pe_close_combined(index_name, df_full, history_state):
         secondary_y=False,
     )
     
-    # 添加 3年/5年均值线 (主 Y 轴)
+    # 添加 3年/5年/10年均值线 (主 Y 轴)
     if 'avg_3yr_roll' in df_plot.columns:
          fig.add_trace(go.Scatter(x=df_plot['Date'], y=df_plot['avg_3yr_roll'], mode='lines', 
                                   name='PE 3年均值', line={'dash': 'dash', 'color': 'gray', 'width': 3}),
@@ -96,8 +107,6 @@ def plot_pe_close_combined(index_name, df_full, history_state):
                        secondary_y=False)
 
 
-
-
     # 2. 点位走势 (副 Y 轴 / 右侧)
     fig.add_trace(
         go.Scatter(x=df_plot['Date'], y=df_plot['Close'], name='点位走势 (右轴)', 
@@ -107,6 +116,7 @@ def plot_pe_close_combined(index_name, df_full, history_state):
 
     # 3. 交易标记 (Buy/Sell)
     if not trade_df.empty:
+        # V23.4: 使用 'close' 和 'pe' 字段来标记交易点
         trade_df_valid = trade_df.dropna(subset=['pe', 'close'])
         buy_trades = trade_df_valid[trade_df_valid['type'] == '买入']
         sell_trades = trade_df_valid[trade_df_valid['type'] == '卖出']
@@ -180,23 +190,27 @@ if actual_file_path:
 
 if metrics_result:
     # 获取指标和完整数据框
-    df_full = metrics_result[5]
+    (curr_pe, curr_percentile, avg3, avg_5yr, avg_10yr, df_full, 
+     max_dev, min_dev, max_dev_date, min_dev_date) = metrics_result
+     
     history_state = state.get(selected_file, {}).get("history", [])
     
     # 尝试获取当前持仓和盈亏数据 (需依赖 dashboard.py 的 metrics 计算)
-    index_metrics = get_full_index_metrics(selected_file, state, {}) 
+    # V23.4 优化：传入已加载的 df_full，避免 get_full_index_metrics 重复加载。
+    index_metrics = get_full_index_metrics(selected_file, state, {selected_file: df_full}) 
 
     # --- 3. 核心指标展示 (来自 1_💰_Trade_Detail.py) ---
     st.subheader(f"💰 {selected_name} 当前持仓概览")
 
     col1, col2, col3, col4 = st.columns(4)
+    current_close_index = index_metrics['current_close']
 
     with col1:
-        st.metric("当前持仓份数", value=index_metrics['holdings'])
+        st.metric("当前持仓份额", value=f"{index_metrics['holdings']:.2f} 份")
 
     with col2:
-        if not np.isnan(index_metrics['current_close']):
-            st.metric("当前指数点位", value=f"{index_metrics['current_close']:.2f}")
+        if not np.isnan(current_close_index):
+            st.metric("当前指数点位", value=f"{current_close_index:.2f}")
         else:
             st.info("点位数据缺失")
 
@@ -208,12 +222,13 @@ if metrics_result:
 
     with col4:
         if not np.isnan(index_metrics['pl_pct']):
-            pl_pct_display = f"{index_metrics['pl_pct'] * 100:.2f}%"
+            pl_pct_value = index_metrics['pl_pct']
+            pl_pct_display = f"{pl_pct_value * 100:.2f}%"
             st.metric(
                 "浮动盈亏 (%)", 
                 value=pl_pct_display, 
-                delta_color=get_pl_color(index_metrics['pl_pct']),
-                delta=f"{index_metrics['pl_pct'] * 100:.2f}%"
+                delta_color=get_pl_color(pl_pct_value),
+                delta=f"{pl_pct_value * 100:.2f}%"
             )
         else:
             st.info("无持仓或成本，无法计算盈亏")
