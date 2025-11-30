@@ -84,12 +84,18 @@ def plot_pe_close_combined(index_name, df_full, history_state):
     # 添加 3年/5年均值线 (主 Y 轴)
     if 'avg_3yr_roll' in df_plot.columns:
          fig.add_trace(go.Scatter(x=df_plot['Date'], y=df_plot['avg_3yr_roll'], mode='lines', 
-                                  name='PE 3年均值', line={'dash': 'dash', 'color': 'gray', 'width': 1}),
+                                  name='PE 3年均值', line={'dash': 'dash', 'color': 'gray', 'width': 3}),
                        secondary_y=False)
     if 'avg_5yr_roll' in df_plot.columns:
          fig.add_trace(go.Scatter(x=df_plot['Date'], y=df_plot['avg_5yr_roll'], mode='lines', 
-                                  name='PE 5年均值', line={'dash': 'dot', 'color': 'lightgray', 'width': 1}),
+                                  name='PE 5年均值', line={'dash': 'dot', 'color': 'lightgray', 'width': 3}),
                        secondary_y=False)
+    if 'avg_10yr_roll' in df_plot.columns:
+         fig.add_trace(go.Scatter(x=df_plot['Date'], y=df_plot['avg_10yr_roll'], mode='lines', 
+                                  name='PE 10年均值', line={'dash': 'dot', 'color': 'red', 'width': 3}),
+                       secondary_y=False)
+
+
 
 
     # 2. 点位走势 (副 Y 轴 / 右侧)
@@ -214,11 +220,30 @@ if metrics_result:
     
     st.markdown("---")
 
-    # --- 4. 走势图展示 (来自 1_📈_Index_Charts.py) ---
+    # --- 4. 走势图展示 (修改版：增加时间筛选) ---
     st.subheader("📊 历史走势分析")
-    plot_pe_close_combined(selected_name, df_full, history_state)
+    
+    # 确保 Date 列是 datetime 类型 (为了筛选)
+    df_full['Date'] = pd.to_datetime(df_full['Date'])
+    min_date = df_full['Date'].min().date()
+    max_date = df_full['Date'].max().date()
 
-    st.markdown("---")
+    # 创建两列用于放置日期选择器
+    col_date1, col_date2 = st.columns([1, 1])
+    with col_date1:
+        start_date = st.date_input("开始日期", value=min_date, min_value=min_date, max_value=max_date)
+    with col_date2:
+        end_date = st.date_input("结束日期", value=max_date, min_value=min_date, max_value=max_date)
+
+    # 根据日期筛选数据
+    mask = (df_full['Date'].dt.date >= start_date) & (df_full['Date'].dt.date <= end_date)
+    df_filtered = df_full.loc[mask]
+
+    # 将筛选后的数据传给绘图函数
+    if not df_filtered.empty:
+        plot_pe_close_combined(selected_name, df_filtered, history_state)
+    else:
+        st.warning("所选时间段内无数据。")
 
     # --- 5. 交易历史表 (来自 1_💰_Trade_Detail.py) ---
     st.subheader("📜 交易历史记录")
