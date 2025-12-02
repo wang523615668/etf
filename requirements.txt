@@ -2,4 +2,4 @@ streamlit
 pandas
 numpy
 plotly
-# 确保您的应用中用到的所有库都在这里
+akshare
