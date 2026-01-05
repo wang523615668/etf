@@ -9,14 +9,16 @@ from datetime import datetime, timedelta
 
 # ==================== 1. 页面配置 ====================
 st.set_page_config(
-    page_title="智能资产配置 Pro (完整版)",
+    page_title="智能资产配置 Pro (终极版)",
     page_icon="💹",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# ==================== 2. 全局配置 ====================
-DEFAULT_TOKEN = "71f8bc4a-2a8c-4a38-bc43-4bede4dba831"
+# ==================== 2. 全局配置与存储 ====================
+# 默认备用 Token (如果本地没有保存文件时使用)
+FALLBACK_TOKEN = "71f8bc4a-2a8c-4a38-bc43-4bede4dba831"
+TOKEN_FILE = "token.conf"
 
 MARKET_INDEX_CODE = "000985" 
 MARKET_INDEX_NAME = "A股全指"
@@ -34,7 +36,35 @@ DATA_DIR = "market_data"
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-# ==================== 3. 核心数据引擎 (智能缓存版) ====================
+# ==================== 3. Token 管理逻辑 (新增) ====================
+def get_and_save_token():
+    """读取并处理 Token 的保存逻辑"""
+    # 1. 尝试从本地文件读取
+    current_saved_token = FALLBACK_TOKEN
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r") as f:
+                content = f.read().strip()
+                if len(content) > 10: # 简单校验
+                    current_saved_token = content
+        except:
+            pass
+
+    # 2. 显示输入框
+    user_token = st.text_input("理杏仁 Token (修改后自动保存)", value=current_saved_token, type="password")
+
+    # 3. 如果用户修改了 Token，立即保存到文件
+    if user_token != current_saved_token:
+        with open(TOKEN_FILE, "w") as f:
+            f.write(user_token)
+        st.toast("Token 已更新并保存到本地！", icon="💾")
+        # 稍微延迟让用户看到提示，然后刷新使用新Token
+        time.sleep(1)
+        st.rerun()
+        
+    return user_token
+
+# ==================== 4. 核心数据引擎 (智能缓存版) ====================
 
 def fetch_chunk(token, url, payload_template, start_dt, end_dt):
     """API请求辅助函数"""
@@ -54,21 +84,17 @@ def fetch_from_api_incremental(token, code, years, local_df=None):
     """执行 API 增量/全量拉取"""
     end_date = datetime.now()
     
-    # 计算目标起始时间
     if years > 10:
         target_start_date = datetime(2005, 1, 1)
     else:
         target_start_date = end_date - timedelta(days=years * 365 + 60)
 
-    # 确定本次请求的起点
     if local_df is not None and not local_df.empty:
         local_start = local_df.index[0]
-        # 如果本地数据够老（覆盖了目标起点），则只增量更新后面
         if local_start <= target_start_date + timedelta(days=30): 
             start_date = local_df.index[-1] + timedelta(days=1)
             is_incremental = True
         else:
-            # 本地数据不足以覆盖历史，强制全量
             start_date = target_start_date
             is_incremental = False
     else:
@@ -159,7 +185,6 @@ def get_smart_data(token, code, years, force_update=False):
         except:
             local_df = None
 
-    # 检查本地历史是否足够
     data_is_sufficient = True
     if local_df is not None and not local_df.empty:
         local_start = local_df.index[0]
@@ -190,11 +215,11 @@ def get_smart_data(token, code, years, force_update=False):
 
     return local_df, "no_action"
 
-# ==================== 4. 统计逻辑 (修正切片逻辑) ====================
+# ==================== 5. 统计逻辑 ====================
 def calculate_metrics(df, lookback_years):
     if df is None or df.empty: return None
     
-    # 1. 确定分析窗口 (Slicing) - 修正分位点计算逻辑
+    # 切片逻辑：根据滑块选择计算分位点
     end_date = df.index[-1]
     if lookback_years > 10:
         start_date = datetime(2005, 1, 1)
@@ -216,12 +241,11 @@ def calculate_metrics(df, lookback_years):
     res["当前PE_中位"] = pe_med_cur
     res["当前PB"] = pb_cur
     
-    # 使用 Window 数据计算分位
     res["PE分位"] = (df_window["PE_正数等权"] < pe_cur).mean() * 100
     res["PE分位_中位"] = (df_window["PE_中位数"] < pe_med_cur).mean() * 100
     res["PB分位"] = (df_window["PB_中位数"] < pb_cur).mean() * 100
     
-    # 均值 (客观指标，使用固定窗口)
+    # 均值 (客观全历史)
     df_5y = df.iloc[-1250:] if len(df) > 1250 else df
     df_10y = df.iloc[-2500:] if len(df) > 2500 else df
     
@@ -280,7 +304,7 @@ def scan_market(token, index_map, lookback_years, force_update):
     status_box.empty()
     return pd.DataFrame(data)
 
-# ==================== 5. 主界面逻辑 ====================
+# ==================== 6. 主界面逻辑 ====================
 def main():
     st.title("🛡️ 智能财富仪表盘 Pro")
     
@@ -289,7 +313,10 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ 参数")
-        token = st.text_input("Token", value=DEFAULT_TOKEN, type="password")
+        
+        # ✅ 使用新的 Token 管理函数
+        token = get_and_save_token()
+        
         lookback = st.slider("估值分位参考周期 (年)", 3, 20, 10)
         st.caption("注：调整此年限，表格中的'PE分位'会随之变化。")
         
@@ -343,14 +370,13 @@ def main():
 
     st.markdown("---")
 
-    # ================= 【已找回】全景对比图 =================
+    # ================= 🎢 全市场中位数估值巡礼 (已找回) =================
     st.markdown("### 🎢 全市场中位数估值巡礼")
     with st.expander("📊 点击加载所有指数中位数对比", expanded=False):
         if st.button("🚀 加载全景对比图"):
             with st.spinner("正在加载本地数据..."):
                 fig_all = go.Figure()
                 for name, code in INDEX_MAP.items():
-                    # 这里复用 get_smart_data，优先读本地，很快
                     df_tmp, _ = get_smart_data(token, code, lookback, force_update=False)
                     if df_tmp is not None and not df_tmp.empty:
                         fig_all.add_trace(go.Scatter(
