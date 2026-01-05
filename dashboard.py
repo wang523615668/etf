@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 # ==================== 1. 页面配置 ====================
 st.set_page_config(
-    page_title="智能资产配置 Pro (修复版)",
+    page_title="智能资产配置 Pro (完整版)",
     page_icon="💹",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -62,10 +62,9 @@ def fetch_from_api_incremental(token, code, years, local_df=None):
 
     # 确定本次请求的起点
     if local_df is not None and not local_df.empty:
-        # 如果本地数据够老（覆盖了目标起点），则只增量更新后面
-        # 如果本地数据太新（比如只有最近1年），而用户要20年，则需要全量重新拉取
         local_start = local_df.index[0]
-        if local_start <= target_start_date + timedelta(days=30): # 允许30天误差
+        # 如果本地数据够老（覆盖了目标起点），则只增量更新后面
+        if local_start <= target_start_date + timedelta(days=30): 
             start_date = local_df.index[-1] + timedelta(days=1)
             is_incremental = True
         else:
@@ -76,7 +75,6 @@ def fetch_from_api_incremental(token, code, years, local_df=None):
         start_date = target_start_date
         is_incremental = False
             
-    # 如果起点已经在今天之后，无需请求
     if start_date.date() > end_date.date():
         return local_df, "local_latest"
 
@@ -107,7 +105,6 @@ def fetch_from_api_incremental(token, code, years, local_df=None):
         if not df_fund_list: 
             return local_df, "no_new_data"
             
-        # 合并新数据
         df_fund_new = pd.concat(df_fund_list).drop_duplicates(subset=['date'])
         df_fund_new["date"] = pd.to_datetime(df_fund_new["date"]).dt.tz_localize(None)
         df_fund_new = df_fund_new.set_index("date").sort_index()
@@ -129,12 +126,10 @@ def fetch_from_api_incremental(token, code, years, local_df=None):
         for col in rename_map.values():
             if col in df_new.columns: df_new[col] = pd.to_numeric(df_new[col], errors='coerce')
             
-        # 结果合并
         if is_incremental and local_df is not None:
             df_new = df_new[~df_new.index.isin(local_df.index)]
             df_final = pd.concat([local_df, df_new]).sort_index()
         else:
-            # 全量或本地不足，直接用新的
             df_final = df_new
 
         return df_final, "updated"
@@ -147,7 +142,6 @@ def get_smart_data(token, code, years, force_update=False):
     """
     智能数据获取器
     """
-    # 1. 确定文件名
     idx_name = "未知"
     if code == MARKET_INDEX_CODE: idx_name = MARKET_INDEX_NAME
     else:
@@ -156,7 +150,6 @@ def get_smart_data(token, code, years, force_update=False):
     
     file_path = os.path.join(DATA_DIR, f"{idx_name}_{code}.csv")
     
-    # 2. 读取本地数据
     local_df = None
     if os.path.exists(file_path):
         try:
@@ -166,37 +159,29 @@ def get_smart_data(token, code, years, force_update=False):
         except:
             local_df = None
 
-    # 3. 检查本地数据历史是否足够长
+    # 检查本地历史是否足够
     data_is_sufficient = True
     if local_df is not None and not local_df.empty:
         local_start = local_df.index[0]
-        # 计算需要的起始时间
         if years > 10:
             req_start = datetime(2005, 1, 1)
         else:
             req_start = datetime.now() - timedelta(days=years * 365)
         
-        # 如果本地数据开始时间 晚于 需要的时间 (说明缺历史)，则必须联网
         if local_start > req_start + timedelta(days=60):
             data_is_sufficient = False
     else:
         data_is_sufficient = False
 
-    # 4. 判断是否需要联网
     today_str = datetime.now().strftime("%Y-%m-%d")
     
-    # 如果本地有数据，且足够长，且是最新的，且未强制更新 -> 直接返回
     if local_df is not None and not local_df.empty:
         last_date_str = local_df.index[-1].strftime("%Y-%m-%d")
         if last_date_str == today_str and not force_update and data_is_sufficient:
             return local_df, "local_cache_hit"
-        
-        # 如果不强制，且数据够长（即使不是今天），也先用本地
         if not force_update and data_is_sufficient:
              return local_df, "local_cache_old"
 
-    # 5. 联网更新 (强制，或数据不足，或数据太旧)
-    # 注意：如果 force_update=False 但 data_is_sufficient=False，也会进来
     df_final, status = fetch_from_api_incremental(token, code, years, local_df)
     
     if df_final is not None and not df_final.empty:
@@ -205,27 +190,21 @@ def get_smart_data(token, code, years, force_update=False):
 
     return local_df, "no_action"
 
-# ==================== 4. 统计逻辑 (核心修正) ====================
+# ==================== 4. 统计逻辑 (修正切片逻辑) ====================
 def calculate_metrics(df, lookback_years):
-    """
-    修正版：接受 lookback_years 参数
-    先根据年限对 df 进行切片，再计算分位点，确保 10年/20年 数据不同。
-    """
     if df is None or df.empty: return None
     
-    # 1. 确定分析窗口 (Slicing)
-    # 如果选20年(>10)，则使用全量历史(2005起)；否则截取最近N年
+    # 1. 确定分析窗口 (Slicing) - 修正分位点计算逻辑
     end_date = df.index[-1]
     if lookback_years > 10:
         start_date = datetime(2005, 1, 1)
     else:
         start_date = end_date - timedelta(days=lookback_years * 365)
         
-    # ✅ 关键修正：切片，只取窗口内的数据算分位
     df_window = df[df.index >= start_date]
-    if df_window.empty: df_window = df # 容错
+    if df_window.empty: df_window = df 
     
-    latest = df.iloc[-1] # 当前值依然取最新
+    latest = df.iloc[-1]
     res = {}
     
     pe_cur = latest.get("PE_正数等权", 0)
@@ -237,12 +216,12 @@ def calculate_metrics(df, lookback_years):
     res["当前PE_中位"] = pe_med_cur
     res["当前PB"] = pb_cur
     
-    # ✅ 使用切片后的 df_window 计算分位
+    # 使用 Window 数据计算分位
     res["PE分位"] = (df_window["PE_正数等权"] < pe_cur).mean() * 100
     res["PE分位_中位"] = (df_window["PE_中位数"] < pe_med_cur).mean() * 100
     res["PB分位"] = (df_window["PB_中位数"] < pb_cur).mean() * 100
     
-    # 均值 (使用固定窗口，不受滑块影响，保持客观)
+    # 均值 (客观指标，使用固定窗口)
     df_5y = df.iloc[-1250:] if len(df) > 1250 else df
     df_10y = df.iloc[-2500:] if len(df) > 2500 else df
     
@@ -255,7 +234,6 @@ def calculate_metrics(df, lookback_years):
     res["偏离5年(%)"] = (pe_cur - pe_avg_5y) / pe_avg_5y * 100
     res["偏离10年(%)"] = (pe_cur - pe_avg_10y) / pe_avg_10y * 100
     
-    # 操作建议
     pct = res["PE分位"]
     if pct <= 10: res["操作建议"] = "💎 极低 (买入)"
     elif pct <= 30: res["操作建议"] = "🟢 偏低 (定投)"
@@ -275,11 +253,9 @@ def scan_market(token, index_map, lookback_years, force_update):
         status_box.text(f"正在读取: {name}...")
         prog.progress((i + 1) / total)
         
-        # 调用智能获取器
         df, status = get_smart_data(token, code, lookback_years, force_update)
         
         if df is not None:
-            # 传入 lookback_years 进行正确计算
             m = calculate_metrics(df, lookback_years)
             if m:
                 data.append({
@@ -314,7 +290,6 @@ def main():
     with st.sidebar:
         st.header("⚙️ 参数")
         token = st.text_input("Token", value=DEFAULT_TOKEN, type="password")
-        # 提示用户
         lookback = st.slider("估值分位参考周期 (年)", 3, 20, 10)
         st.caption("注：调整此年限，表格中的'PE分位'会随之变化。")
         
@@ -358,7 +333,6 @@ def main():
                                        line=dict(color='red', width=2), fill='tozeroy'))
             fig_m.add_trace(go.Scatter(x=df_market.index, y=df_market["PE_中位数"], name="PE(中位)", 
                                        line=dict(color='blue', width=2, dash='dash')))
-            
             fig_m.update_layout(
                 height=300, margin=dict(l=0, r=0, t=10, b=0), template="plotly_white", hovermode="x unified",
                 yaxis=dict(tickmode='linear', tick0=9, dtick=5, range=[9, 109]) 
@@ -369,12 +343,31 @@ def main():
 
     st.markdown("---")
 
+    # ================= 【已找回】全景对比图 =================
+    st.markdown("### 🎢 全市场中位数估值巡礼")
+    with st.expander("📊 点击加载所有指数中位数对比", expanded=False):
+        if st.button("🚀 加载全景对比图"):
+            with st.spinner("正在加载本地数据..."):
+                fig_all = go.Figure()
+                for name, code in INDEX_MAP.items():
+                    # 这里复用 get_smart_data，优先读本地，很快
+                    df_tmp, _ = get_smart_data(token, code, lookback, force_update=False)
+                    if df_tmp is not None and not df_tmp.empty:
+                        fig_all.add_trace(go.Scatter(
+                            x=df_tmp.index, y=df_tmp["PE_中位数"], name=name, opacity=0.8, line=dict(width=1.5)
+                        ))
+                fig_all.update_layout(
+                    title="全市场 PE(中位数) 历史走势大比拼",
+                    yaxis=dict(tickmode='linear', tick0=9, dtick=5, range=[9, 109]),
+                    height=600, hovermode="x unified", template="plotly_white", legend=dict(orientation="h", y=1.1)
+                )
+                st.plotly_chart(fig_all, use_container_width=True)
+
+    st.markdown("---")
+
     # ================= 细分指数表格 =================
     st.subheader("📋 细分赛道数据透视")
     
-    # 只要 force_update 为 True，或者第一次加载，就运行 scan
-    # 另外：如果 lookback 变了，也应该刷新计算结果(虽然不一定重新拉取数据)
-    # 所以这里不加 session_state 的锁，每次页面刷新都重新计算（计算很快，拉取有缓存）
     st.session_state['scan_df'] = scan_market(token, INDEX_MAP, lookback, force_update)
             
     if not st.session_state['scan_df'].empty:
