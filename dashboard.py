@@ -1,361 +1,461 @@
-# dashboard.py (V25.17 - 修复图表标题遮挡 + 强力清洗 + 核心总览表)
-
 import streamlit as st
 import pandas as pd
-import numpy as np
-import json
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import requests
+import time
 import os
 from datetime import datetime, timedelta
-import time
-import glob
-import plotly.express as px
-import plotly.graph_objects as go
 
-# ================= 1. 系统配置 =================
+# ==================== 1. 页面配置 ====================
+st.set_page_config(
+    page_title="智能资产配置 Pro (修复版)",
+    page_icon="💹",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-st.set_page_config(page_title="智能资产配置 Pro", layout="wide", page_icon="📈")
+# ==================== 2. 全局配置 ====================
+DEFAULT_TOKEN = "71f8bc4a-2a8c-4a38-bc43-4bede4dba831"
 
-DATA_DIR = "index_data"
-STATE_FILE = "portfolio_status.json"
+MARKET_INDEX_CODE = "000985" 
+MARKET_INDEX_NAME = "A股全指"
 
-# 指数列表
-TARGETS = {
-    "大盘": "大盘指数", 
-    "沪深300": "沪深300",
-    "中证500": "中证500",
-    "创业板": "创业板指",
-    "上证50": "上证50",
-    "白酒": "中证白酒",
-    "医疗": "中证医疗",
-    "医药": "全指医药",
-    "消费": "全指消费",
-    "养老": "养老产业",
-    "红利": "中证红利",
-    "金融": "全指金融",
-    "证券": "证券公司",
-    "传媒": "中证传媒",
-    "环保": "中证环保",
-    "信息": "全指信息",
+INDEX_MAP = {
+    "沪深300": "000300", "上证50": "000016", "中证500": "000905", "创业板指": "399006",
+    "科创50": "000688", "中证红利": "000922", "中证白酒": "399997", "中证医疗": "399989", 
+    "中证传媒": "399971", "证券公司": "399975", "中证银行": "399986", "中证环保": "000827", 
+    "全指消费": "000990", "全指医药": "000991", "全指金融": "000992", "全指信息": "000993", 
+    "养老产业": "399812"
 }
 
-DEFAULT_STRATEGY_PARAMS = {
-    "MAX_UNITS": 150, "AMOUNT_PER_UNIT": 1000.0, "MIN_INTERVAL_DAYS": 30
-}
+# 📂 数据保存路径
+DATA_DIR = "market_data"
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
 
-# ================= 2. 核心数据引擎 =================
+# ==================== 3. 核心数据引擎 (智能缓存版) ====================
 
-def initialize_session_state():
-    if 'strategy_params' not in st.session_state:
-        st.session_state['strategy_params'] = DEFAULT_STRATEGY_PARAMS
-
-def get_strategy_param(key):
-    initialize_session_state()
-    return st.session_state['strategy_params'].get(key, DEFAULT_STRATEGY_PARAMS.get(key))
-
-def load_state():
-    initial_state = {v: {"holdings": 0.0, "total_cost": 0.0, "history": []} for v in TARGETS.values()}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, 'r', encoding='utf-8') as f: 
-                state = json.load(f)
-            for k in initial_state.keys():
-                if k not in state: state[k] = initial_state[k]
-            return state
-        except: return initial_state
-    return initial_state
-
-def save_state(state):
+def fetch_chunk(token, url, payload_template, start_dt, end_dt):
+    """API请求辅助函数"""
+    payload = payload_template.copy()
+    payload['startDate'] = start_dt.strftime("%Y-%m-%d")
+    payload['endDate'] = end_dt.strftime("%Y-%m-%d")
     try:
-        with open(STATE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(state, f, ensure_ascii=False, indent=4)
-        return True
-    except Exception as e: return False
-
-def recalculate_holdings(state):
-    for code, data in state.items():
-        if 'history' in data:
-            units, cost = 0.0, 0.0
-            for t in data['history']:
-                u, p = float(t.get('unit',0)), float(t.get('price',0))
-                if t['type'] == '买入': cost += p*u; units += u
-                elif t['type'] == '卖出':
-                    if units > 0:
-                        avg = cost/units; cost -= avg*u; units -= u
-                        if units < 1e-6: units=0; cost=0
-            state[code]['holdings'] = max(0, units)
-            state[code]['total_cost'] = max(0, cost)
-    return state
-
-def find_csv_for_target(target_keyword):
-    if not os.path.exists(DATA_DIR): return None
-    candidates = glob.glob(os.path.join(DATA_DIR, f"*{target_keyword}*.csv"))
-    if not candidates: return None
-    return max(candidates, key=os.path.getmtime)
-
-@st.cache_data(ttl=600)
-def get_metrics_from_csv(file_path):
-    if not file_path: return None
-    try:
-        # 1. 尝试读取
-        try:
-            df = pd.read_csv(file_path, encoding='utf-8')
-        except UnicodeDecodeError:
-            df = pd.read_csv(file_path, encoding='gbk')
-        
-        # 2. 列名标准化
-        rename_map = {}
-        for col in df.columns:
-            c_lower = str(col).lower()
-            if '日期' in col or 'date' in c_lower: rename_map[col] = 'Date'
-            elif '收盘' in col or 'close' in c_lower: rename_map[col] = 'Close'
-            elif '分位' in col: rename_map[col] = 'pe_percentile'
-            elif 'pe' in c_lower or '市盈率' in col: rename_map[col] = 'pe'
-        
-        df = df.rename(columns=rename_map)
-        df = df.loc[:, ~df.columns.duplicated()] # 去重
-        
-        # 3. 强力清洗
-        cols_to_clean = ['pe', 'Close', 'pe_percentile']
-        for c in cols_to_clean:
-            if c in df.columns:
-                if df[c].dtype == object:
-                    df[c] = df[c].astype(str).str.replace('=', '').str.replace('"', '').str.replace(',', '')
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-        
-        # 4. 基础处理
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-        df = df.dropna(subset=['Date', 'pe']).sort_values('Date').set_index('Date')
-        if df.empty: return None
-        
-        # 5. 计算指标
-        curr_pe = df['pe'].iloc[-1]
-        curr_close = df['Close'].iloc[-1] if 'Close' in df.columns else 0.0
-        
-        if 'pe_percentile' not in df.columns:
-            if len(df) > 10:
-                df['pe_percentile'] = df['pe'].rank(pct=True)
-            else:
-                df['pe_percentile'] = 0.5 
-        
-        curr_pct = df['pe_percentile'].iloc[-1]
-        
-        df['avg_3yr'] = df['pe'].rolling(window=750, min_periods=1).mean()
-        df['avg_5yr'] = df['pe'].rolling(window=1250, min_periods=1).mean()
-        
-        avg_3yr = df['avg_3yr'].iloc[-1] if not pd.isna(df['avg_3yr'].iloc[-1]) else curr_pe
-        avg_5yr = df['avg_5yr'].iloc[-1] if not pd.isna(df['avg_5yr'].iloc[-1]) else avg_3yr
-        long_term_avg = avg_5yr if len(df) >= 750 else avg_3yr
-        
-        return curr_pe, curr_pct, avg_3yr, avg_5yr, long_term_avg, curr_close, df
-        
-    except Exception as e:
+        res = requests.post(url, json=payload, headers={'Content-Type': 'application/json'}, timeout=15)
+        res_json = res.json()
+        if res_json.get("code") == 1:
+            return pd.DataFrame(res_json.get("data", []))
+        return None
+    except:
         return None
 
-# === 修复核心：布局调整 ===
-def plot_pe_bands(df, index_name):
-    if 'Close' not in df.columns or 'pe' not in df.columns: return None
+def fetch_from_api_incremental(token, code, years, local_df=None):
+    """执行 API 增量/全量拉取"""
+    end_date = datetime.now()
     
-    df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-    df['pe'] = pd.to_numeric(df['pe'], errors='coerce')
-    df['Earnings'] = df['Close'] / df['pe']
-    
-    recent_df = df.iloc[-1250:] if len(df) > 1250 else df
-    pe_20 = recent_df['pe'].quantile(0.20)
-    pe_50 = recent_df['pe'].quantile(0.50)
-    pe_80 = recent_df['pe'].quantile(0.80)
-    
-    smooth_earnings = df['Earnings'].rolling(window=20, min_periods=1).mean()
-    
-    df['Band_High'] = smooth_earnings * pe_80
-    df['Band_Mid'] = smooth_earnings * pe_50
-    df['Band_Low'] = smooth_earnings * pe_20
-    
-    plot_df = df.iloc[-750:] if len(df) > 750 else df
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Close'], name='当前价格', line=dict(color='black', width=2)))
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Band_High'], name=f'高估({pe_80:.1f})', line=dict(color='#ff4d4d', width=1, dash='dot')))
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Band_Mid'], name=f'中枢({pe_50:.1f})', line=dict(color='#ffa500', width=1, dash='dot')))
-    fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Band_Low'], name=f'低估({pe_20:.1f})', line=dict(color='#2ecc71', width=1, dash='dot')))
-    
-    # ⚠️ 修复点：调整 layout
-    fig.update_layout(
-        title=dict(
-            text=f"📈 {index_name} - 估值通道图",
-            x=0.01, # 标题靠左
-            y=0.95  # 标题置顶
-        ),
-        height=400,
-        # 增加顶部边距 (t=80)，防止遮挡
-        margin=dict(l=20, r=20, t=80, b=20), 
-        legend=dict(
-            orientation="h", 
-            y=1.15, # 图例上移
-            x=0
-        ),
-        hovermode="x unified"
-    )
-    return fig
-
-# ================= 3. 主界面逻辑 =================
-
-initialize_session_state()
-state = load_state()
-
-# --- 侧边栏 ---
-with st.sidebar:
-    st.header("⚙️ 策略参数")
-    AMT = st.number_input("定投金额", value=get_strategy_param("AMOUNT_PER_UNIT"))
-    MAX_U = st.number_input("总份数", value=get_strategy_param("MAX_UNITS"))
-    if st.button("保存参数"):
-        st.session_state['strategy_params'].update({"AMOUNT_PER_UNIT": AMT, "MAX_UNITS": MAX_U})
-        st.success("已保存")
-
-# --- 宏观水位 ---
-col_k1, col_k2 = st.columns([2, 1])
-macro_pct = np.nan
-macro_file = find_csv_for_target("大盘")
-if macro_file:
-    m = get_metrics_from_csv(macro_file)
-    if m: macro_pct = m[1]
-
-with col_k2.container(border=True):
-    if not np.isnan(macro_pct):
-        st.metric("大盘水位", f"{macro_pct*100:.1f}%", delta="基于全A/上证", delta_color="inverse")
-    else: st.warning("缺大盘数据")
-
-st.markdown("---")
-
-# --- 核心功能：数据处理与表格生成 ---
-table_rows = []
-analysis_list = []
-
-for kw, name in TARGETS.items():
-    fpath = find_csv_for_target(kw)
-    res = get_metrics_from_csv(fpath)
-    
-    s = state.get(name, {})
-    holdings = s.get('holdings', 0.0)
-    cost = s.get('total_cost', 0.0)
-    
-    if res:
-        curr_pe, curr_pct, avg3, avg5, long_avg, curr_close, df_hist = res
-        
-        # 策略逻辑
-        signal = "⏸️ 观望"
-        status = "normal"
-        
-        is_low_pct = curr_pct < 0.20
-        is_below_avg = curr_pe < long_avg
-        
-        if is_low_pct and is_below_avg:
-            signal = "🟢 强力买入"
-            status = "buy_strong"
-        elif is_low_pct and not is_below_avg:
-            signal = "🟡 观望(高于均线)"
-            status = "watch_avg"
-        elif curr_pct < 0.40 and is_below_avg:
-            signal = "🔵 定投区"
-            status = "buy_normal"
-        elif curr_pct > 0.80:
-            signal = "🔴 止盈区"
-            status = "sell"
-        
-        market_value = holdings * curr_close if curr_close > 0 else cost
-        profit = market_value - cost
-        profit_pct = (profit / cost) if cost > 0 else 0.0
-        
-        table_rows.append({
-            "指数名称": name,
-            "建议信号": signal,
-            "PE百分位": f"{curr_pct*100:.1f}%",
-            "当前PE": f"{curr_pe:.2f}",
-            "5年均线": f"{long_avg:.2f}",
-            "偏离度": f"{(curr_pe - long_avg)/long_avg*100:+.1f}%",
-            "持仓市值": f"¥{market_value:,.0f}",
-            "持仓收益": f"{profit_pct*100:+.2f}%" if cost > 0 else "—",
-            "最新净值": f"{curr_close:.4f}"
-        })
-        
-        analysis_list.append({
-            "name": name, "pct": curr_pct, "pe": curr_pe, "avg": long_avg,
-            "signal": signal, "status": status, "df": df_hist
-        })
+    # 计算目标起始时间
+    if years > 10:
+        target_start_date = datetime(2005, 1, 1)
     else:
-        table_rows.append({
-            "指数名称": name, "建议信号": "❌ 文件错误", "PE百分位": "—", "当前PE": "—",
-            "5年均线": "—", "偏离度": "—", "持仓市值": "—", "持仓收益": "—", "最新净值": "—"
-        })
-        analysis_list.append({"name": name, "pct": 999, "signal": "❌ 文件错误", "status": "err"})
+        target_start_date = end_date - timedelta(days=years * 365 + 60)
 
-# === 1. 显示核心资产总览表 ===
-st.subheader("📋 核心资产总览")
-
-def color_signal(val):
-    if "强力买入" in str(val): return 'background-color: #d4edda; color: #155724; font-weight: bold'
-    if "定投区" in str(val): return 'color: #004085; font-weight: bold'
-    if "止盈区" in str(val): return 'background-color: #f8d7da; color: #721c24; font-weight: bold'
-    if "观望" in str(val): return 'color: #856404'
-    return ''
-
-if table_rows:
-    df_table = pd.DataFrame(table_rows)
-    st.dataframe(
-        df_table.style.applymap(color_signal, subset=['建议信号']),
-        use_container_width=True,
-        height=500 
-    )
-
-st.markdown("---")
-
-# === 2. 详情与图表 ===
-st.subheader("🔍 深度分析与通道图")
-
-analysis_list.sort(key=lambda x: (
-    0 if x.get('status') == 'buy_strong' else 
-    1 if x.get('status') == 'buy_normal' else 
-    2 if x.get('status') == 'watch_avg' else 3
-))
-
-c_list, c_chart = st.columns([1, 3])
-
-with c_list:
-    st.caption("选择查看详情 👇")
-    selected_name = st.radio("资产列表", [x['name'] for x in analysis_list], label_visibility="collapsed")
-    item = next(x for x in analysis_list if x['name'] == selected_name)
-
-with c_chart:
-    if item.get('df') is not None:
-        k1, k2, k3 = st.columns(3)
-        k1.metric("当前PE", f"{item['pe']:.2f}")
-        k2.metric("5年均线", f"{item['avg']:.2f}", delta=f"{item['pe'] - item['avg']:.2f}", delta_color="inverse")
-        k3.metric("PE分位", f"{item['pct']*100:.1f}%")
-        
-        st.info(f"**操作建议**: {item['signal']}")
-        
-        fig = plot_pe_bands(item['df'], item['name'])
-        st.plotly_chart(fig, use_container_width=True)
-        
+    # 确定本次请求的起点
+    if local_df is not None and not local_df.empty:
+        # 如果本地数据够老（覆盖了目标起点），则只增量更新后面
+        # 如果本地数据太新（比如只有最近1年），而用户要20年，则需要全量重新拉取
+        local_start = local_df.index[0]
+        if local_start <= target_start_date + timedelta(days=30): # 允许30天误差
+            start_date = local_df.index[-1] + timedelta(days=1)
+            is_incremental = True
+        else:
+            # 本地数据不足以覆盖历史，强制全量
+            start_date = target_start_date
+            is_incremental = False
     else:
-        st.error("❌ 无法读取该指数数据")
+        start_date = target_start_date
+        is_incremental = False
+            
+    # 如果起点已经在今天之后，无需请求
+    if start_date.date() > end_date.date():
+        return local_df, "local_latest"
 
-# --- 记账模块 ---
-st.divider()
-with st.expander("📝 记账"):
-    c1,c2,c3,c4 = st.columns(4)
-    t_n = c1.selectbox("指数", list(TARGETS.values()))
-    t_d = c2.selectbox("方向", ["买入", "卖出"])
-    t_p = c3.number_input("净值", 1.0)
-    t_u = c4.number_input("份额", 100.0)
-    if st.button("保存"):
-        d_str = datetime.now().strftime("%Y-%m-%d")
-        curr_pe = 0
-        f_csv = find_csv_for_target(next(k for k,v in TARGETS.items() if v==t_n))
-        if f_csv:
-             m = get_metrics_from_csv(f_csv)
-             if m: curr_pe = m[0]
-             
-        state[t_n]['history'].append({"date": d_str, "type": t_d, "price": t_p, "unit": t_u, "pe": curr_pe})
-        save_state(recalculate_holdings(state))
-        st.success("已保存")
-        time.sleep(0.5); st.rerun()
+    url_fund = "https://open.lixinger.com/api/cn/index/fundamental"
+    metrics_fund = ["pe_ttm.ewpvo", "pe_ttm.median", "pb.median"]
+    payload_fund_tmpl = {"token": token, "stockCodes": [code], "metricsList": metrics_fund}
+    
+    url_kline = "https://open.lixinger.com/api/cn/index/candlestick"
+    payload_kline_tmpl = {"token": token, "stockCode": code, "type": "normal", "qType": "1d"}
+
+    CHUNK_DAYS = 3200 
+    current_start = start_date
+    df_fund_list = []
+    df_kline_list = []
+    
+    try:
+        while current_start < end_date:
+            current_end = min(current_start + timedelta(days=CHUNK_DAYS), end_date)
+            chunk_fund = fetch_chunk(token, url_fund, payload_fund_tmpl, current_start, current_end)
+            if chunk_fund is not None and not chunk_fund.empty: df_fund_list.append(chunk_fund)
+            
+            chunk_kline = fetch_chunk(token, url_kline, payload_kline_tmpl, current_start, current_end)
+            if chunk_kline is not None and not chunk_kline.empty: df_kline_list.append(chunk_kline)
+                
+            current_start = current_end + timedelta(days=1)
+            time.sleep(0.05)
+
+        if not df_fund_list: 
+            return local_df, "no_new_data"
+            
+        # 合并新数据
+        df_fund_new = pd.concat(df_fund_list).drop_duplicates(subset=['date'])
+        df_fund_new["date"] = pd.to_datetime(df_fund_new["date"]).dt.tz_localize(None)
+        df_fund_new = df_fund_new.set_index("date").sort_index()
+        
+        if df_kline_list:
+            df_kline_new = pd.concat(df_kline_list).drop_duplicates(subset=['date'])
+            df_kline_new["date"] = pd.to_datetime(df_kline_new["date"]).dt.tz_localize(None)
+            df_kline_new = df_kline_new.set_index("date")[["close"]]
+            df_new = df_fund_new.join(df_kline_new, how="inner").sort_index()
+        else:
+            df_new = df_fund_new
+            df_new["close"] = None
+
+        rename_map = {
+            "pe_ttm.ewpvo": "PE_正数等权", "pe_ttm.median": "PE_中位数",
+            "pb.median": "PB_中位数", "close": "指数点位"
+        }
+        df_new = df_new.rename(columns=rename_map)
+        for col in rename_map.values():
+            if col in df_new.columns: df_new[col] = pd.to_numeric(df_new[col], errors='coerce')
+            
+        # 结果合并
+        if is_incremental and local_df is not None:
+            df_new = df_new[~df_new.index.isin(local_df.index)]
+            df_final = pd.concat([local_df, df_new]).sort_index()
+        else:
+            # 全量或本地不足，直接用新的
+            df_final = df_new
+
+        return df_final, "updated"
+        
+    except Exception as e:
+        return local_df, f"Error: {str(e)}"
+
+@st.cache_data(ttl=3600)
+def get_smart_data(token, code, years, force_update=False):
+    """
+    智能数据获取器
+    """
+    # 1. 确定文件名
+    idx_name = "未知"
+    if code == MARKET_INDEX_CODE: idx_name = MARKET_INDEX_NAME
+    else:
+        found = [k for k, v in INDEX_MAP.items() if v == code]
+        if found: idx_name = found[0]
+    
+    file_path = os.path.join(DATA_DIR, f"{idx_name}_{code}.csv")
+    
+    # 2. 读取本地数据
+    local_df = None
+    if os.path.exists(file_path):
+        try:
+            local_df = pd.read_csv(file_path)
+            local_df["date"] = pd.to_datetime(local_df["date"])
+            local_df = local_df.set_index("date").sort_index()
+        except:
+            local_df = None
+
+    # 3. 检查本地数据历史是否足够长
+    data_is_sufficient = True
+    if local_df is not None and not local_df.empty:
+        local_start = local_df.index[0]
+        # 计算需要的起始时间
+        if years > 10:
+            req_start = datetime(2005, 1, 1)
+        else:
+            req_start = datetime.now() - timedelta(days=years * 365)
+        
+        # 如果本地数据开始时间 晚于 需要的时间 (说明缺历史)，则必须联网
+        if local_start > req_start + timedelta(days=60):
+            data_is_sufficient = False
+    else:
+        data_is_sufficient = False
+
+    # 4. 判断是否需要联网
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    
+    # 如果本地有数据，且足够长，且是最新的，且未强制更新 -> 直接返回
+    if local_df is not None and not local_df.empty:
+        last_date_str = local_df.index[-1].strftime("%Y-%m-%d")
+        if last_date_str == today_str and not force_update and data_is_sufficient:
+            return local_df, "local_cache_hit"
+        
+        # 如果不强制，且数据够长（即使不是今天），也先用本地
+        if not force_update and data_is_sufficient:
+             return local_df, "local_cache_old"
+
+    # 5. 联网更新 (强制，或数据不足，或数据太旧)
+    # 注意：如果 force_update=False 但 data_is_sufficient=False，也会进来
+    df_final, status = fetch_from_api_incremental(token, code, years, local_df)
+    
+    if df_final is not None and not df_final.empty:
+        df_final.to_csv(file_path, encoding='utf-8-sig')
+        return df_final, status
+
+    return local_df, "no_action"
+
+# ==================== 4. 统计逻辑 (核心修正) ====================
+def calculate_metrics(df, lookback_years):
+    """
+    修正版：接受 lookback_years 参数
+    先根据年限对 df 进行切片，再计算分位点，确保 10年/20年 数据不同。
+    """
+    if df is None or df.empty: return None
+    
+    # 1. 确定分析窗口 (Slicing)
+    # 如果选20年(>10)，则使用全量历史(2005起)；否则截取最近N年
+    end_date = df.index[-1]
+    if lookback_years > 10:
+        start_date = datetime(2005, 1, 1)
+    else:
+        start_date = end_date - timedelta(days=lookback_years * 365)
+        
+    # ✅ 关键修正：切片，只取窗口内的数据算分位
+    df_window = df[df.index >= start_date]
+    if df_window.empty: df_window = df # 容错
+    
+    latest = df.iloc[-1] # 当前值依然取最新
+    res = {}
+    
+    pe_cur = latest.get("PE_正数等权", 0)
+    pe_med_cur = latest.get("PE_中位数", 0)
+    pb_cur = latest.get("PB_中位数", 0)
+    
+    res["当前点位"] = latest.get("指数点位", 0)
+    res["当前PE"] = pe_cur
+    res["当前PE_中位"] = pe_med_cur
+    res["当前PB"] = pb_cur
+    
+    # ✅ 使用切片后的 df_window 计算分位
+    res["PE分位"] = (df_window["PE_正数等权"] < pe_cur).mean() * 100
+    res["PE分位_中位"] = (df_window["PE_中位数"] < pe_med_cur).mean() * 100
+    res["PB分位"] = (df_window["PB_中位数"] < pb_cur).mean() * 100
+    
+    # 均值 (使用固定窗口，不受滑块影响，保持客观)
+    df_5y = df.iloc[-1250:] if len(df) > 1250 else df
+    df_10y = df.iloc[-2500:] if len(df) > 2500 else df
+    
+    pe_avg_5y = df_5y["PE_正数等权"].mean()
+    pe_avg_10y = df_10y["PE_正数等权"].mean()
+    
+    res["5年均PE"] = pe_avg_5y
+    res["10年均PE"] = pe_avg_10y
+    
+    res["偏离5年(%)"] = (pe_cur - pe_avg_5y) / pe_avg_5y * 100
+    res["偏离10年(%)"] = (pe_cur - pe_avg_10y) / pe_avg_10y * 100
+    
+    # 操作建议
+    pct = res["PE分位"]
+    if pct <= 10: res["操作建议"] = "💎 极低 (买入)"
+    elif pct <= 30: res["操作建议"] = "🟢 偏低 (定投)"
+    elif pct >= 90: res["操作建议"] = "⚠️ 极高 (清仓)"
+    elif pct >= 70: res["操作建议"] = "🔴 偏高 (卖出)"
+    else: res["操作建议"] = "⚖️ 正常 (持有)"
+        
+    return res
+
+def scan_market(token, index_map, lookback_years, force_update):
+    data = []
+    prog = st.progress(0)
+    status_box = st.empty()
+    total = len(index_map)
+    
+    for i, (name, code) in enumerate(index_map.items()):
+        status_box.text(f"正在读取: {name}...")
+        prog.progress((i + 1) / total)
+        
+        # 调用智能获取器
+        df, status = get_smart_data(token, code, lookback_years, force_update)
+        
+        if df is not None:
+            # 传入 lookback_years 进行正确计算
+            m = calculate_metrics(df, lookback_years)
+            if m:
+                data.append({
+                    "指数": name,
+                    "代码": code,
+                    "PE(正等)": m['当前PE'],
+                    "PE分位": m['PE分位'],
+                    "操作建议": m['操作建议'], 
+                    "偏离5年(%)": m['偏离5年(%)'], 
+                    "5年均PE": m['5年均PE'],
+                    "10年均PE": m['10年均PE'],
+                    "PE(中位)": m['当前PE_中位'], 
+                    "中位分位": m['PE分位_中位'],
+                    "PB(中位)": m['当前PB'],
+                    "PB分位": m['PB分位'], 
+                })
+        
+        if force_update:
+            time.sleep(0.05)
+    
+    prog.empty()
+    status_box.empty()
+    return pd.DataFrame(data)
+
+# ==================== 5. 主界面逻辑 ====================
+def main():
+    st.title("🛡️ 智能财富仪表盘 Pro")
+    
+    if 'force_update_trigger' not in st.session_state:
+        st.session_state['force_update_trigger'] = False
+
+    with st.sidebar:
+        st.header("⚙️ 参数")
+        token = st.text_input("Token", value=DEFAULT_TOKEN, type="password")
+        # 提示用户
+        lookback = st.slider("估值分位参考周期 (年)", 3, 20, 10)
+        st.caption("注：调整此年限，表格中的'PE分位'会随之变化。")
+        
+        st.markdown("---")
+        st.markdown("### 📡 数据控制")
+        st.info("默认优先读取本地数据 (省流模式)。\n如需获取最新行情，请点击下方按钮。")
+        
+        if st.button("🔄 手动更新数据 (消耗API)", type="primary"):
+            st.session_state['force_update_trigger'] = True
+            st.cache_data.clear()
+            st.rerun()
+
+    force_update = st.session_state['force_update_trigger']
+
+    # ================= 模块 0: 市场总舵 =================
+    st.markdown("### 🧭 市场总温度计 (A股全指)")
+    
+    df_market, status = get_smart_data(token, MARKET_INDEX_CODE, lookback, force_update)
+    
+    if force_update:
+        st.toast("API 更新已触发...", icon="🔄")
+        st.session_state['force_update_trigger'] = False 
+
+    if df_market is not None:
+        m_market = calculate_metrics(df_market, lookback)
+        
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: st.metric("当前点位", f"{m_market['当前点位']:.0f}", delta=f"{m_market['当前点位'] - df_market.iloc[-2]['指数点位']:.1f}")
+        with c2: st.metric("PE (正数等权)", f"{m_market['当前PE']:.2f}", delta=f"{m_market['偏离10年(%)']:.1f}% (偏离10年)", delta_color="inverse")
+        with c3: st.metric("PE (中位数)", f"{m_market['当前PE_中位']:.2f}", help="绿色虚线")
+        with c4:
+            pct_val = m_market['PE分位']
+            delta_color = "normal"
+            if pct_val < 20: delta_color = "off"
+            elif pct_val > 80: delta_color = "inverse"
+            st.metric(f"{'全历史' if lookback>10 else f'近{lookback}年'}分位", f"{pct_val:.1f}%", f"{m_market['操作建议'].split(' ')[1]}", delta_color=delta_color)
+            
+        with st.expander("查看 A股全指 历史走势", expanded=False):
+            fig_m = go.Figure()
+            fig_m.add_trace(go.Scatter(x=df_market.index, y=df_market["PE_正数等权"], name="PE(正等)", 
+                                       line=dict(color='red', width=2), fill='tozeroy'))
+            fig_m.add_trace(go.Scatter(x=df_market.index, y=df_market["PE_中位数"], name="PE(中位)", 
+                                       line=dict(color='blue', width=2, dash='dash')))
+            
+            fig_m.update_layout(
+                height=300, margin=dict(l=0, r=0, t=10, b=0), template="plotly_white", hovermode="x unified",
+                yaxis=dict(tickmode='linear', tick0=9, dtick=5, range=[9, 109]) 
+            )
+            st.plotly_chart(fig_m, use_container_width=True)
+    else:
+        st.error("无法获取数据，请检查Token或网络，并尝试点击【手动更新数据】")
+
+    st.markdown("---")
+
+    # ================= 细分指数表格 =================
+    st.subheader("📋 细分赛道数据透视")
+    
+    # 只要 force_update 为 True，或者第一次加载，就运行 scan
+    # 另外：如果 lookback 变了，也应该刷新计算结果(虽然不一定重新拉取数据)
+    # 所以这里不加 session_state 的锁，每次页面刷新都重新计算（计算很快，拉取有缓存）
+    st.session_state['scan_df'] = scan_market(token, INDEX_MAP, lookback, force_update)
+            
+    if not st.session_state['scan_df'].empty:
+        df_show = st.session_state['scan_df']
+        
+        def style_dataframe(df):
+            def color_deviation(val):
+                if isinstance(val, (int, float)):
+                    color = '#E74C3C' if val > 0 else '#2ECC71'
+                    return f'color: {color}; font-weight: bold'
+                return ''
+
+            def color_suggestion(val):
+                if '买入' in val: color = '#2ECC71'
+                elif '卖出' in val: color = '#E74C3C'
+                elif '清仓' in val: color = '#C0392B'
+                elif '定投' in val: color = '#27AE60'
+                else: color = '#F39C12'
+                return f'color: {color}; font-weight: bold'
+
+            return df.style.map(color_deviation, subset=['偏离5年(%)'])\
+                           .map(color_suggestion, subset=['操作建议'])\
+                           .format({
+                               "PE(正等)": "{:.2f}", "PE分位": "{:.1f}%", 
+                               "PE(中位)": "{:.2f}", "中位分位": "{:.1f}%",
+                               "5年均PE": "{:.2f}", "10年均PE": "{:.2f}",
+                               "偏离5年(%)": "{:+.1f}%",
+                               "PB(中位)": "{:.2f}", "PB分位": "{:.1f}%"
+                           })
+
+        st.dataframe(
+            style_dataframe(df_show),
+            column_config={
+                "指数": st.column_config.TextColumn("指数", width="small", pinned=True),
+                "操作建议": st.column_config.TextColumn("操作建议", width="small"),
+                "偏离5年(%)": st.column_config.NumberColumn("偏离5年", help="红高绿低"),
+            },
+            use_container_width=True, height=600, hide_index=True
+        )
+    else:
+        st.info("👈 数据加载中...")
+
+    # ================= 深度透视 =================
+    st.markdown("---")
+    st.subheader("🔍 深度透视")
+    
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        all_options = {MARKET_INDEX_NAME: MARKET_INDEX_CODE, **INDEX_MAP}
+        sel_name = st.selectbox("选择指数", list(all_options.keys()))
+        
+        df_detail, _ = get_smart_data(token, all_options[sel_name], lookback, force_update)
+        
+        if df_detail is not None:
+            m = calculate_metrics(df_detail, lookback)
+            st.success(f"建议：{m['操作建议']}")
+            st.metric("5年偏离度", f"{m['偏离5年(%)']:+.2f}%")
+            st.metric("10年偏离度", f"{m['偏离10年(%)']:+.2f}%")
+            st.metric("中位数PE", f"{m['当前PE_中位']:.2f}")
+
+    with c2:
+        if df_detail is not None:
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            
+            fig.add_trace(go.Scatter(x=df_detail.index, y=df_detail["PE_正数等权"], name="PE (正数等权)", line=dict(color="red", width=2.5)), secondary_y=False)
+            fig.add_trace(go.Scatter(x=df_detail.index, y=df_detail["PE_中位数"], name="PE (中位数)", line=dict(color="blue", width=2, dash='dash')), secondary_y=False)
+            
+            df_detail['MA5'] = df_detail['PE_正数等权'].rolling(window=250*5).mean()
+            fig.add_trace(go.Scatter(x=df_detail.index, y=df_detail["MA5"], name="5年均线", line=dict(color="orange", width=1.5, dash='dot')), secondary_y=False)
+            
+            df_detail['MA10'] = df_detail['PE_正数等权'].rolling(window=250*10).mean()
+            fig.add_trace(go.Scatter(x=df_detail.index, y=df_detail["MA10"], name="10年均线", line=dict(color="black", width=1.5, dash='dot')), secondary_y=False)
+            
+            fig.add_trace(go.Scatter(x=df_detail.index, y=df_detail["指数点位"], name="指数点位", line=dict(color="#34495E", width=1), opacity=0.2), secondary_y=True)
+            
+            fig.update_layout(
+                title=f"{sel_name} 估值深度透视", height=500, hovermode="x unified", template="plotly_white",
+                yaxis=dict(title="PE 估值", tickmode='linear', tick0=9, dtick=5, range=[9, 109]),
+                yaxis2=dict(title="指数点位", showgrid=False)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+if __name__ == "__main__":
+    main()
